@@ -25,10 +25,13 @@ def test_header_round_trip_200_random():
     rng = random.Random(1)
     ids = [f.id for f in schema.active()]
     for _ in range(200):
-        chosen = rng.sample(ids, rng.randint(0, len(ids)))
-        pkt = make_packet(rng.choice([DATA, REPAIR, SKIP, NACK]),
-                          rng.randrange(1 << 14), sorted(chosen),
-                          version=rng.randrange(256), fec=rng.randrange(256))
+        ptype = rng.choice([DATA, REPAIR, SKIP, NACK])
+        if ptype in (DATA, REPAIR):
+            chosen = rng.sample(ids, rng.randint(0, len(ids)))
+            pkt = make_packet(ptype, rng.randrange(1 << 14), sorted(chosen),
+                              version=rng.randrange(256), fec=rng.randrange(256))
+        else:   # SKIP / NACK: no payload, the bitmap is a plain mask
+            pkt = Packet(ptype, rng.randrange(1 << 14), rng.randrange(1 << 16), rng.randrange(256))
         assert unpack(pack(pkt)) == pkt
 
 

@@ -5,8 +5,10 @@
   16 bits     UPDATE_BITMAP   bit i set <=> this packet carries field i
   8 bits      FEC             high nibble = parity group, low nibble = index (0 = none)
 
-Payload: for each set bit in ascending field-id order, one version byte, then
-`width` value bytes. Widths come from the schema, never from the packet.
+Payload (DATA and REPAIR only): for each set bit in ascending field-id order,
+one version byte, then `width` value bytes. Widths come from the schema, never
+from the packet. SKIP and NACK carry no payload; their bitmap is just a mask of
+fields (for a NACK: the fields the receiver is asking about).
 """
 
 import struct
@@ -61,11 +63,17 @@ def fields_in(bitmap):
     return [i for i in range(16) if bitmap & (1 << i)]
 
 
+def has_payload(ptype):
+    return ptype in (DATA, REPAIR)
+
+
 def pack(pkt):
-    if pkt.bitmap != bitmap_of(pkt.updates):
-        raise ValueError("bitmap does not match the fields carried")
     body = b""
-    for fid in fields_in(pkt.bitmap):
+    if has_payload(pkt.type) and pkt.bitmap != bitmap_of(pkt.updates):
+        raise ValueError("bitmap does not match the fields carried")
+    if not has_payload(pkt.type) and pkt.updates:
+        raise ValueError("SKIP and NACK carry no payload")
+    for fid in (fields_in(pkt.bitmap) if has_payload(pkt.type) else []):
         version, value = pkt.updates[fid]
         width = schema.by_id(fid).width
         if len(value) != width:
@@ -79,7 +87,7 @@ def unpack(data):
     first, bitmap, fec = _HEADER.unpack_from(data)
     pkt = Packet(first >> config.SEQ_BITS, first & ((1 << config.SEQ_BITS) - 1), bitmap, fec)
     pos = _HEADER.size
-    for fid in fields_in(bitmap):
+    for fid in (fields_in(bitmap) if has_payload(pkt.type) else []):
         width = schema.by_id(fid).width
         pkt.updates[fid] = (data[pos], data[pos + 1:pos + 1 + width])
         pos += 1 + width
