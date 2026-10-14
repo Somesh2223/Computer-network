@@ -30,8 +30,12 @@ def test_header_round_trip_200_random():
             chosen = rng.sample(ids, rng.randint(0, len(ids)))
             pkt = make_packet(ptype, rng.randrange(1 << 14), sorted(chosen),
                               version=rng.randrange(256), fec=rng.randrange(256))
-        else:   # SKIP / NACK: no payload, the bitmap is a plain mask
-            pkt = Packet(ptype, rng.randrange(1 << 14), rng.randrange(1 << 16), rng.randrange(256))
+        elif ptype == SKIP:   # a heartbeat digest: version bytes only
+            chosen = rng.sample(range(16), rng.randint(0, 16))
+            digest = {fid: (rng.randrange(256), b"") for fid in chosen}
+            pkt = Packet(SKIP, rng.randrange(1 << 14), bitmap_of(chosen), rng.randrange(256), digest)
+        else:   # NACK: no payload, the bitmap is a plain mask
+            pkt = Packet(NACK, rng.randrange(1 << 14), rng.randrange(1 << 16), rng.randrange(256))
         assert unpack(pack(pkt)) == pkt
 
 
