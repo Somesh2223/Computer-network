@@ -3,10 +3,14 @@
 Every packet really goes through header.pack() / unpack(); only time and the
 network are pretend. Events live in a heap of (time, tie, kind, data).
 
-Policies, all run against the same data-loss trace:
-  "ours"  per-field supersession + tolerance, plus the liveness heartbeat
-  "arq"   B1 - the sender resends EVERY field of a lost packet, in full
-  "udp"   B4 - no recovery at all
+Policies:
+  "ours"      per-field supersession + tolerance, plus the liveness heartbeat
+  "arq"       B1 - the sender resends EVERY field of a lost packet, in full
+  "udp"       B4 - no recovery at all
+  "snapshot"  B3 - the whole state every tick, fragmented over the MTU; a
+              snapshot counts only if every fragment arrives. No recovery.
+ours, arq and udp see an identical data-loss trace. snapshot sends several
+fragments per tick, so it draws more often and its trace differs.
 
 Three independent random channels, so every policy sees the same data losses:
   fwd_data  one draw per DATA packet, nothing else
@@ -17,13 +21,16 @@ get a different loss pattern, and the comparison would be worthless.
 """
 
 import heapq
+import math
 import random
+import time
 
 import config
 from src import header, schema, supersession
 from src.gap_detector import GapDetector
 from src.generator import Generator
 from src.impairment import make_loss
+from src.metrics import Metrics
 from src.send_log import SendLog
 from src.state_table import StateTable
 
@@ -40,7 +47,7 @@ class Simulation:
                  hold_down_s=config.HOLD_DOWN_S, rtt_s=config.RTT_S,
                  jitter_s=config.JITTER_S, burst=config.BURST,
                  mean_burst_len=config.MEAN_BURST_LEN,
-                 heartbeat_s=config.HEARTBEAT_S, trace=False):
+                 heartbeat_s=config.HEARTBEAT_S, warmup_s=config.WARMUP_S, trace=False):
         self.policy = policy
         self.duration_s, self.tick_s = duration_s, tick_s
         self.hold_down_s, self.rtt_s, self.jitter_s = hold_down_s, rtt_s, jitter_s
@@ -72,6 +79,11 @@ class Simulation:
         self.suppression_events = []   # SUPERSEDED: (time, lost seq, field id, resent seq)
         self.tolerance_events = []     # WITHIN_TOLERANCE: (time, lost seq, field id)
         self.decisions = []            # every verdict: (time, lost seq, field id, outcome)
+
+        # Freshness is measured from when a value was generated. The receiver can't
+        # know that in a real deployment; the simulator can, so it keeps the record.
+        self.gen_time = {}             # (field id, version) -> generation time
+        self.metrics = Metrics([f.id for f in schema.active()], warmup_s, duration_s)
 
         self.stats = dict(data_sent=0, data_lost=0, data_bytes=0,
                           nacks_sent=0, nacks_lost=0, nack_bytes=0,
@@ -115,12 +127,14 @@ class Simulation:
                 self._on_nack(data)
             elif kind == HEARTBEAT:
                 self._on_heartbeat()
+        self.metrics.finish()
         return self
 
     # --- links ----------------------------------------------------------------
 
     def _send_ctrl(self, wire):
         """Forward control channel (repairs, skips, heartbeats). Returns True if lost."""
+        self.metrics.on_wire(len(wire), "ctrl", self.now)
         lost = self.ctrl_loss.drops()
         delay = self.rtt_s / 2 + self.fwd_ctrl.uniform(0, self.jitter_s)
         if not lost:
@@ -129,6 +143,7 @@ class Simulation:
 
     def _send_rev(self, wire):
         """Reverse channel (NACKs). Returns True if lost."""
+        self.metrics.on_wire(len(wire), "rev", self.now)
         lost = self.rev_loss.drops()
         delay = self.rtt_s / 2 + self.rev.uniform(0, self.jitter_s)
         if not lost:
@@ -139,7 +154,13 @@ class Simulation:
 
     def _on_tick(self):
         updates = self.generator.due(self.now)
-        if updates:
+        for fid, (version, _) in updates.items():
+            self.gen_time[(fid, version)] = self.now
+        if self.policy == "snapshot":
+            self.latest_sent.update(updates)
+            if self.latest_sent:
+                self._send_snapshot()
+        elif updates:
             self._send_data(updates)
         if self.now + self.tick_s <= self.duration_s:
             self._push(self.now + self.tick_s, TICK)
@@ -153,11 +174,34 @@ class Simulation:
         wire = header.pack(header.Packet(header.DATA, seq, header.bitmap_of(updates), 0, updates))
         self.stats["data_sent"] += 1
         self.stats["data_bytes"] += len(wire)
+        self.metrics.on_wire(len(wire), "data", self.now)
         lost = self.data_loss.drops()
         delay = self.rtt_s / 2 + self.data_jitter.uniform(0, self.jitter_s)
         if lost:
             self.stats["data_lost"] += 1
             self._log(seq, "LOST", f"seq {seq} carrying [{names(updates)}]")
+        else:
+            self._push(self.now + delay, FWD, wire)
+
+    def _send_snapshot(self):
+        """B3: pack the whole state as one DATA packet, split it into MTU-sized
+        fragments (each with its own header), and deliver it only if all survive."""
+        state = dict(self.latest_sent)
+        seq = self.next_seq
+        self.next_seq = (seq + 1) % (1 << config.SEQ_BITS)
+        wire = header.pack(header.Packet(header.DATA, seq, header.bitmap_of(state), 0, state))
+        payload = len(wire) - config.HEADER_BYTES
+        fragments = math.ceil(payload / (config.MTU - config.HEADER_BYTES))
+        nbytes = payload + fragments * config.HEADER_BYTES
+        self.stats["data_sent"] += 1
+        self.stats["data_bytes"] += nbytes
+        self.metrics.on_wire(nbytes, "data", self.now)
+        lost = False
+        for _ in range(fragments):          # one draw per fragment, every time
+            lost = self.data_loss.drops() or lost
+        delay = self.rtt_s / 2 + self.data_jitter.uniform(0, self.jitter_s)
+        if lost:
+            self.stats["data_lost"] += 1
         else:
             self._push(self.now + delay, FWD, wire)
 
@@ -176,7 +220,9 @@ class Simulation:
             self._send_reply(header.REPAIR, nack.seq, contents)
             return
 
+        started = time.perf_counter_ns()
         decision = supersession.decide(nack.seq, nack.bitmap, self.send_log)
+        self.metrics.on_decision((time.perf_counter_ns() - started) / 1000)
         if not decision.fields:
             self._log(nack.seq, "DECIDE", "nothing left to judge: the fast path already "
                                           "struck off every field this packet carried")
@@ -252,6 +298,7 @@ class Simulation:
         for fid, (version, value) in pkt.updates.items():
             if self.receiver.apply(fid, version, value):
                 applied_ids.append(fid)
+                self.metrics.on_delivered(fid, self.now, self.gen_time[(fid, version)], len(value))
             else:
                 obsolete_ids.append(fid)
         if pkt.type == header.REPAIR and pkt.fec == header.HB_MARK:
@@ -267,7 +314,7 @@ class Simulation:
             if obsolete_ids:
                 text += f"; already had newer [{names(obsolete_ids)}]"
             self._log(pkt.seq, "REPAIR", text)
-        elif self.policy != "udp":
+        elif self.policy in ("ours", "arq"):
             for seq in self.gaps.on_data(pkt.seq, pkt.updates):
                 self._log(seq, "GAP", f"receiver detects seq {seq} never arrived")
                 self._push(self.now + self.hold_down_s, TIMER, seq)

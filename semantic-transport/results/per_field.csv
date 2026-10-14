@@ -1,0 +1,10 @@
+field,period_ms,vs_t_star,aoi_ours_s,aoi_arq_s,aoi_udp_s,superseded,within_tolerance,repair
+attitude,10,below,0.0401,0.0401,0.0401,0,0,0
+velocity,20,below,0.0458,0.0458,0.0458,2240,0,0
+lidar_scan,50,below,0.0632,0.063,0.0632,1488,0,0
+gps,100,above,0.0927,0.0912,0.0928,320,469,0
+battery,1000,above,0.6019,0.5544,0.6282,0,77,0
+mode,5000,above,2.5338,2.6437,2.8922,0,0,13
+terrain_map,10000,above,5.0169,5.0054,5.4223,0,0,4
+fault_code,event,event,9.3306,9.3205,10.758,0,0,8
+waypoint,event,event,9.1289,9.2411,9.9114,0,0,10
