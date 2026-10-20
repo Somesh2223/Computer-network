@@ -2,6 +2,7 @@
 
   python experiments.py                 all studies (about 12 minutes)
   python experiments.py fec workload    just the named studies
+  python experiments.py realnet         figure from netem_bench.py's CSVs (run that first)
 
 Writes everything to results/. Numbers are findings, not targets: nothing here
 is tuned to reproduce a figure written down earlier.
@@ -12,6 +13,7 @@ is tuned to reproduce a figure written down earlier.
   4. workload sensitivity  - how the saving depends on the byte-weight of fast fields
   5. fec                   - selective repetition vs blanket FEC (B2) at matched bytes
   6. invariants            - the hard checks of BUILD_PROMPT §11, over all runs
+  7. realnet               - real sockets and kernel TCP under tc/netem (Phase 9)
 """
 
 import csv
@@ -311,6 +313,72 @@ def fec_study(duration_s=180.0):
     return rows, runs_ours_fec
 
 
+# --- 7. real network (Phase 9) --------------------------------------------------
+
+REALNET_LABEL = {"ours": "Ours", "ours_fec": "Ours + repetition", "arq": "B1 full ARQ",
+                 "udp": "B4 plain UDP", "tcp": "Kernel TCP"}
+
+
+def read_csv(name):
+    with open(os.path.join(OUT, name), newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def realnet_figure():
+    """Summarise and plot netem_bench.py's runs (real sockets, real kernel, tc/netem)."""
+    runs, sweep = read_csv("realnet_runs.csv"), read_csv("realnet_sweep.csv")
+    summary = []
+    for policy, label in REALNET_LABEL.items():
+        rows = [r for r in runs if r["policy"] == policy]
+        row = dict(policy=label)
+        for key in ("wire_bytes", "recovery_bytes", "mean_aoi_s", "critical_on_time_pct",
+                    "latency_p95_ms", "latency_p99_ms"):
+            m, h = mean_ci([float(r[key]) for r in rows])
+            row[key], row[key + "_ci95"] = round(m, 3), round(h, 3)
+        fs = [r["false_suppressions"] for r in rows if r["false_suppressions"] != ""]
+        row["false_suppressions"] = sum(int(x) for x in fs) if fs else ""
+        summary.append(row)
+    write_csv("realnet_summary.csv", summary)
+
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 4.6), facecolor=SURFACE)
+    colours = {"Ours": ACCENT, "Ours + repetition": "#7fb0ea", "B1 full ARQ": GREY,
+               "B4 plain UDP": "#c9c8c2", "Kernel TCP": SECOND}
+    names = [r["policy"] for r in summary]
+    # Dots with CI, log scale: TCP's latency is orders of magnitude above the rest.
+    left.errorbar(range(len(summary)), [r["latency_p99_ms"] for r in summary],
+                  yerr=[r["latency_p99_ms_ci95"] for r in summary], fmt="none", ecolor=INK_2, capsize=3)
+    left.scatter(range(len(summary)), [r["latency_p99_ms"] for r in summary], s=70, zorder=3,
+                 color=[colours[n] for n in names])
+    for i, r in enumerate(summary):
+        left.text(i + 0.12, r["latency_p99_ms"], f"{r['latency_p99_ms']:,.0f} ms", fontsize=8,
+                  color=INK, va="center")
+    left.set_yscale("log")
+    left.set_xticks(range(len(names)), names, rotation=15)
+    left.set_ylabel("p99 freshness latency (ms, log scale)", color=INK_2)
+    style(left, "Worst-case delay of fresh state, real kernel under netem",
+          "10% burst loss, RTT 60 ms, 30 s runs, 5 seeds, 95% CI")
+    for policy, colour in (("ours", ACCENT), ("udp", GREY), ("tcp", SECOND)):
+        pts = []
+        for loss in sorted({float(r["loss"]) for r in sweep}):
+            vals = [float(r["latency_p99_ms"]) for r in sweep
+                    if r["policy"] == policy and float(r["loss"]) == loss]
+            m, h = mean_ci(vals)
+            pts.append((100 * loss, m, h))
+        right.errorbar([x for x, _, _ in pts], [m for _, m, _ in pts], yerr=[h for _, _, h in pts],
+                       color=colour, marker="o", markersize=5, linewidth=2, capsize=3,
+                       label=REALNET_LABEL[policy])
+    right.set_yscale("log")
+    right.set_xlabel("i.i.d. loss rate (%)", color=INK_2)
+    right.set_ylabel("p99 freshness latency (ms, log scale)", color=INK_2)
+    style(right, "Tail latency against loss rate, real kernel under netem",
+          "i.i.d. loss, RTT 60 ms, 20 s runs, 3 seeds, 95% CI")
+    right.legend(frameon=False, fontsize=9, labelcolor=INK)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "fig_realnet.png"), dpi=160)
+    plt.close(fig)
+    return summary
+
+
 # --- 6. invariants -------------------------------------------------------------
 
 def check_invariants(policy_runs, field_runs, fec_runs=()):
@@ -351,7 +419,14 @@ def check_invariants(policy_runs, field_runs, fec_runs=()):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    wanted = set(sys.argv[1:]) or {"crossover", "policy", "fields", "workload", "fec"}
+    wanted = set(sys.argv[1:]) or {"crossover", "policy", "fields", "workload", "fec", "realnet"}
+    if "realnet" in wanted and os.path.exists(os.path.join(OUT, "realnet_runs.csv")):
+        print("real-network figure")
+        print("\nReal sockets + kernel under tc/netem (10% burst loss, 5 seeds)")
+        for r in realnet_figure():
+            print(f"  {r['policy']:<18} wire {r['wire_bytes']:>9,.0f} B  recovery {r['recovery_bytes']:>8,.0f} B"
+                  f"  AoI {r['mean_aoi_s']:.3f} s  critical on time {r['critical_on_time_pct']:6.2f}%"
+                  f"  p99 {r['latency_p99_ms']:>8,.0f} ms  false supp {r['false_suppressions']}")
     if "crossover" in wanted:
         print("crossover sweep")
         crossover_sweep()
