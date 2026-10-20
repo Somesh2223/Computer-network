@@ -115,7 +115,13 @@ def replay(field_ids, generated, deliveries, warmup_s, end_s, wire_bytes):
 
 
 def on_time_rate(fields, generated, deliveries, gen_time, warmup_s, end_s):
-    """Share of critical-field updates that the receiver had (or had something newer
+    """Share of critical-field updates delivered within their deadline (see on_time_counts)."""
+    on_time, scored = on_time_counts(fields, generated, deliveries, gen_time, warmup_s, end_s)
+    return on_time / scored if scored else 1.0
+
+
+def on_time_counts(fields, generated, deliveries, gen_time, warmup_s, end_s):
+    """(delivered on time, scored) for critical-field updates: the receiver had (or had something newer
     than) within the field's deadline D_f. Review 1's critical-field recovery rate.
 
     fields:     the critical Field objects to score
@@ -138,7 +144,7 @@ def on_time_rate(fields, generated, deliveries, gen_time, warmup_s, end_s):
             first = min((t for _, t in got[i:]), default=None)
             if first is not None and first - g <= f.deadline:
                 on_time += 1
-    return on_time / scored if scored else 1.0
+    return on_time, scored
 
 
 def _percentile(samples, q):

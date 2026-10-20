@@ -61,6 +61,32 @@ class UdpLink:
         return self.pending[0][0] if self.pending else None
 
 
+def event_loop(sim, sock, link, incoming, clock, end, stop=None):
+    """Drive one end in real time until `end` (or until `stop` is set): the
+    simulator's timers fire from its heap, packets arrive from the socket."""
+    selector = selectors.DefaultSelector()
+    selector.register(sock, selectors.EVENT_READ)
+    while clock() < end and not (stop is not None and stop.is_set()):
+        while sim.next_event_time() is not None and sim.next_event_time() <= clock():
+            when, _, kind, data = sim.pop_event()
+            sim.now = when                      # keep ticks on schedule, not on when we woke
+            sim.handle(kind, data)
+        link.flush()
+        wake = [end] + [t for t in (sim.next_event_time(), link.next_due()) if t is not None]
+        timeout = max(0.0, min(wake) - clock())
+        if stop is not None:
+            timeout = min(timeout, 0.05)        # notice a stop request promptly
+        for _ in selector.select(timeout):
+            while True:
+                try:
+                    wire = sock.recv(65535)
+                except (BlockingIOError, ConnectionResetError):
+                    break
+                sim.now = clock()
+                sim.handle(incoming, wire)
+    selector.close()
+
+
 def address(text):
     host, port = text.rsplit(":", 1)
     return host, int(port)
@@ -81,29 +107,12 @@ def run_end(args):
     sim = Simulation(args.seed, args.policy, loss_rate=args.loss, burst=not args.iid,
                      rtt_s=args.rtt, jitter_s=args.jitter, duration_s=args.duration, link=link)
     incoming = REV if sender else FWD          # the sender only hears NACKs; the receiver, data
-    selector = selectors.DefaultSelector()
-    selector.register(sock, selectors.EVENT_READ)
-
     while clock() < 0:                          # wait for the agreed start time
         time.sleep(min(0.05, -clock()))
     if sender:
         sim.start()
     end = args.duration + DRAIN_S + (0.0 if sender else 0.5)
-    while clock() < end:
-        while sim.next_event_time() is not None and sim.next_event_time() <= clock():
-            when, _, kind, data = sim.pop_event()
-            sim.now = when                      # keep ticks on schedule, not on when we woke
-            sim.handle(kind, data)
-        link.flush()
-        wake = [end] + [t for t in (sim.next_event_time(), link.next_due()) if t is not None]
-        for _ in selector.select(max(0.0, min(wake) - clock())):
-            while True:
-                try:
-                    wire = sock.recv(65535)
-                except BlockingIOError:
-                    break
-                sim.now = clock()
-                sim.handle(incoming, wire)
+    event_loop(sim, sock, link, incoming, clock, end)
     sock.close()
 
     log = dict(role=args.role, stats=sim.stats, wire_bytes=sim.metrics.wire_bytes)

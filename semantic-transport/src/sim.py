@@ -60,14 +60,19 @@ class Simulation:
                  mean_burst_len=config.MEAN_BURST_LEN,
                  heartbeat_s=config.HEARTBEAT_S, warmup_s=config.WARMUP_S, trace=False,
                  link=None, repetitions=config.REPETITIONS, fec_group=config.FEC_GROUP,
-                 fec_every=1):
+                 fec_every=1, source=None, record=True):
         self.policy = policy
         self.duration_s, self.tick_s = duration_s, tick_s
         self.hold_down_s, self.rtt_s, self.jitter_s = hold_down_s, rtt_s, jitter_s
         self.heartbeat_s = heartbeat_s
         self.link = link             # None = simulated link (the heap); else a real socket
 
-        self.generator = Generator(random.Random(seed + 1))
+        # Where new values come from: the synthetic sensors, or an application's
+        # set() calls (semstate.py) through any object with the same due(now) method.
+        self.generator = source if source is not None else Generator(random.Random(seed + 1))
+        # record=False keeps no per-packet history, for a long-running application
+        # where those lists would only grow. Experiments and the demo need it on.
+        self.record = record
         self.fwd_data = random.Random(seed + 2)
         self.fwd_ctrl = random.Random(seed + 3)
         self.rev = random.Random(seed + 4)
@@ -204,8 +209,9 @@ class Simulation:
     def _on_tick(self):
         updates = self.generator.due(self.now)
         for fid, (version, _) in updates.items():
-            self.gen_time[(fid, version)] = self.now
-            self.generated.append((self.now, fid, version))
+            if self.record:
+                self.gen_time[(fid, version)] = self.now
+                self.generated.append((self.now, fid, version))
         if self.policy == "snapshot":
             self.latest_sent.update(updates)
             if self.latest_sent:
@@ -226,7 +232,8 @@ class Simulation:
         seq = self.next_seq
         self.next_seq = (seq + 1) % (1 << config.SEQ_BITS)
         self.send_log.record(seq, updates, self.now)
-        self.transmissions.append((self.now, seq, frozenset(updates)))
+        if self.record:
+            self.transmissions.append((self.now, seq, frozenset(updates)))
         fec_byte = 0
         if self.policy == "fec":            # B2: mark the packet's place in its parity group
             group = self.fec_groups_done % 14 + 1
@@ -321,15 +328,18 @@ class Simulation:
         for d in decision.fields:
             f = schema.by_id(d.field_id)
             self._log(nack.seq, "DECIDE", f"{f.name}  {d.outcome.value} - {d.detail}")
-            self.decisions.append((self.now, nack.seq, d.field_id, d.outcome))
+            if self.record:
+                self.decisions.append((self.now, nack.seq, d.field_id, d.outcome))
             if d.outcome is supersession.Outcome.SUPERSEDED:
                 self.stats["fields_superseded"] += 1
                 self.stats["bytes_superseded"] += f.width
-                self.suppression_events.append((self.now, nack.seq, d.field_id, d.resent_seq))
+                if self.record:
+                    self.suppression_events.append((self.now, nack.seq, d.field_id, d.resent_seq))
             elif d.outcome is supersession.Outcome.WITHIN_TOLERANCE:
                 self.stats["fields_tolerated"] += 1
                 self.stats["bytes_tolerated"] += f.width
-                self.tolerance_events.append((self.now, nack.seq, d.field_id))
+                if self.record:
+                    self.tolerance_events.append((self.now, nack.seq, d.field_id))
             else:
                 self.stats["fields_repaired"] += 1
         if decision.reply_is_skip():
@@ -395,7 +405,8 @@ class Simulation:
         for fid, (version, value) in pkt.updates.items():
             if self.receiver.apply(fid, version, value):
                 applied_ids.append(fid)
-                self.deliveries.append((self.now, fid, version, len(value)))
+                if self.record:
+                    self.deliveries.append((self.now, fid, version, len(value)))
                 if (fid, version) in self.gen_time:     # always, unless sender is another process
                     self.metrics.on_delivered(fid, self.now, self.gen_time[(fid, version)], len(value))
             else:
