@@ -114,6 +114,33 @@ def replay(field_ids, generated, deliveries, warmup_s, end_s, wire_bytes):
     return m
 
 
+def on_time_rate(fields, generated, deliveries, gen_time, warmup_s, end_s):
+    """Share of critical-field updates that the receiver had (or had something newer
+    than) within the field's deadline D_f. Review 1's critical-field recovery rate.
+
+    fields:     the critical Field objects to score
+    generated:  (time, field id, version) at the sender
+    deliveries: (time, field id, version, bytes) applied at the receiver
+    gen_time:   (field id, version) -> generation time
+    """
+    arrivals = {}            # field id -> [(generation time of the value, when it arrived)]
+    for t, fid, version, _ in deliveries:
+        arrivals.setdefault(fid, []).append((gen_time[(fid, version)], t))
+    scored = on_time = 0
+    for f in fields:
+        got = sorted(arrivals.get(f.id, []))
+        for g, fid, _ in generated:
+            if fid != f.id or not warmup_s <= g <= end_s - f.deadline:
+                continue
+            scored += 1
+            # the first arrival of this value or any newer one
+            i = bisect.bisect_left(got, (g, -1.0))
+            first = min((t for _, t in got[i:]), default=None)
+            if first is not None and first - g <= f.deadline:
+                on_time += 1
+    return on_time / scored if scored else 1.0
+
+
 def _percentile(samples, q):
     if not samples:
         return 0.0

@@ -23,13 +23,16 @@ class SendLog:
     def record(self, seq, updates, now):
         """Note a DATA packet. Repairs are NOT recorded: they reuse the lost seq."""
         for fid, (version, value) in updates.items():
-            if fid in self.last_time:
-                gap = now - self.last_time[fid]
-                old = self.ewma_interval.get(fid)
-                # EWMA: mostly the old estimate, nudged towards the newest gap, so one
-                # odd gap (e.g. an event field firing twice quickly) doesn't swing it.
-                self.ewma_interval[fid] = gap if old is None else self.alpha * gap + (1 - self.alpha) * old
-            self.last_time[fid] = now
+            # Only a NEW value moves the update-rate estimate. A repeat copy of the
+            # same version (selective FEC) is a re-send, not an update.
+            if version != self.last_version.get(fid):
+                if fid in self.last_time:
+                    gap = now - self.last_time[fid]
+                    old = self.ewma_interval.get(fid)
+                    # EWMA: mostly the old estimate, nudged towards the newest gap, so one
+                    # odd gap (e.g. an event field firing twice quickly) doesn't swing it.
+                    self.ewma_interval[fid] = gap if old is None else self.alpha * gap + (1 - self.alpha) * old
+                self.last_time[fid] = now
             self.last_seq[fid] = seq
             self.last_version[fid] = version
             self.last_value[fid] = value

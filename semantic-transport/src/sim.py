@@ -9,10 +9,13 @@ instead of back onto the heap. Nothing else changes.
 
 Policies:
   "ours"      per-field supersession + tolerance, plus the liveness heartbeat
+  "ours_fec"  ours + selective repetition of small critical fields (fec.py)
   "arq"       B1 - the sender resends EVERY field of a lost packet, in full
   "udp"       B4 - no recovery at all
   "snapshot"  B3 - the whole state every tick, fragmented over the MTU; a
               snapshot counts only if every fragment arrives. No recovery.
+  "fec"       B2 - blanket XOR parity: one parity packet per group of data
+              packets, for every field alike. No NACKs.
 ours, arq and udp see an identical data-loss trace. snapshot sends several
 fragments per tick, so it draws more often and its trace differs.
 
@@ -30,7 +33,7 @@ import random
 import time
 
 import config
-from src import header, schema, supersession
+from src import fec, header, schema, supersession
 from src.gap_detector import GapDetector
 from src.generator import Generator
 from src.impairment import make_loss
@@ -39,6 +42,10 @@ from src.send_log import SendLog
 from src.state_table import StateTable
 
 TICK, FWD, TIMER, REV, HEARTBEAT = "TICK", "FWD", "TIMER", "REV", "HEARTBEAT"
+
+OURS = ("ours", "ours_fec")              # supersession + tolerance + heartbeat
+NACKING = ("ours", "ours_fec", "arq")    # policies whose receiver reports gaps
+FEC_MEMORY_S = 1.0                       # B2 receiver keeps packets this long for rebuilds
 
 
 def names(field_ids):
@@ -52,7 +59,8 @@ class Simulation:
                  jitter_s=config.JITTER_S, burst=config.BURST,
                  mean_burst_len=config.MEAN_BURST_LEN,
                  heartbeat_s=config.HEARTBEAT_S, warmup_s=config.WARMUP_S, trace=False,
-                 link=None):
+                 link=None, repetitions=config.REPETITIONS, fec_group=config.FEC_GROUP,
+                 fec_every=1):
         self.policy = policy
         self.duration_s, self.tick_s = duration_s, tick_s
         self.hold_down_s, self.rtt_s, self.jitter_s = hold_down_s, rtt_s, jitter_s
@@ -72,6 +80,15 @@ class Simulation:
         self.latest_sent = {}        # truth: field id -> (version, value)
         self.send_log = SendLog()
         self.next_seq = 0
+        self.repeater = fec.Repeater(
+            fec.protected_fields(schema.active(), config.REPETITION_MAX_WIDTH),
+            repetitions if policy == "ours_fec" else 0, config.REPETITION_SPACING)
+        # B2: parity over each group of fec_group data packets; fec_every > 1 sends
+        # parity for only every n-th group, to match another policy's byte budget.
+        self.fec_group, self.fec_every = fec_group, fec_every
+        self.fec_wires = []          # this group's packets, as sent
+        self.fec_groups_done = 0
+        self.fec_received = {}       # receiver: seq -> (arrival time, wire), for rebuilds
         # receiver
         self.receiver = StateTable()
         self.gaps = GapDetector(f.id for f in schema.active())
@@ -104,7 +121,8 @@ class Simulation:
                           repair_fields_applied=0, repair_fields_obsolete=0,
                           repair_bytes_obsolete=0,
                           heartbeats_sent=0, heartbeat_bytes=0, hb_requests=0,
-                          hb_fields_reconciled=0)
+                          hb_fields_reconciled=0, repeat_bytes=0,
+                          parity_sent=0, parity_bytes=0, fec_recovered=0)
 
         # Episode trace for demo.py: (time, seq, kind, text). Off unless asked for.
         self.trace = [] if trace else None
@@ -124,7 +142,7 @@ class Simulation:
     def start(self):
         """The sender's first events: the first tick, and the first heartbeat."""
         self._push(0.0, TICK)
-        if self.policy == "ours":
+        if self.policy in OURS:
             self._push(self.heartbeat_s, HEARTBEAT)
 
     def handle(self, kind, data):
@@ -192,8 +210,14 @@ class Simulation:
             self.latest_sent.update(updates)
             if self.latest_sent:
                 self._send_snapshot()
-        elif updates:
-            self._send_data(updates)
+        else:
+            new = updates
+            updates = self.repeater.add(updates, self.latest_sent)   # no-op unless ours_fec
+            for fid in updates:
+                if fid not in new:
+                    self.stats["repeat_bytes"] += 1 + schema.by_id(fid).width
+            if updates:
+                self._send_data(updates)
         if self.now + self.tick_s <= self.duration_s:
             self._push(self.now + self.tick_s, TICK)
 
@@ -203,7 +227,11 @@ class Simulation:
         self.next_seq = (seq + 1) % (1 << config.SEQ_BITS)
         self.send_log.record(seq, updates, self.now)
         self.transmissions.append((self.now, seq, frozenset(updates)))
-        wire = header.pack(header.Packet(header.DATA, seq, header.bitmap_of(updates), 0, updates))
+        fec_byte = 0
+        if self.policy == "fec":            # B2: mark the packet's place in its parity group
+            group = self.fec_groups_done % 14 + 1
+            fec_byte = header.fec_byte(group, len(self.fec_wires) + 1)
+        wire = header.pack(header.Packet(header.DATA, seq, header.bitmap_of(updates), fec_byte, updates))
         self.stats["data_sent"] += 1
         self.stats["data_bytes"] += len(wire)
         self.metrics.on_wire(len(wire), "data", self.now)
@@ -214,6 +242,38 @@ class Simulation:
             self._log(seq, "LOST", f"seq {seq} carrying [{names(updates)}]")
         else:
             self._deliver(FWD, wire, delay)
+        if self.policy == "fec":
+            self._fec_sent(seq, wire)
+
+    def _fec_sent(self, seq, wire):
+        """B2: once a group is full, send its XOR parity (on the control channel)."""
+        self.fec_wires.append((seq, wire))
+        if len(self.fec_wires) < self.fec_group:
+            return
+        first_seq, group = self.fec_wires[0][0], self.fec_groups_done % 14 + 1
+        if self.fec_groups_done % self.fec_every == 0:
+            parity = fec.parity_of([w for _, w in self.fec_wires])
+            pwire = header.pack(header.Packet(header.DATA, first_seq, 0, header.fec_byte(group, 0),
+                                              parity=parity))
+            self.stats["parity_sent"] += 1
+            self.stats["parity_bytes"] += len(pwire)
+            self._send_ctrl(pwire)
+        self.fec_groups_done += 1
+        self.fec_wires = []
+
+    def _on_parity(self, pkt):
+        """B2 receiver: if exactly one packet of the group is missing, rebuild it."""
+        # Only packets that arrived recently can belong to this group: sequence numbers
+        # wrap, and a leftover from 16384 seqs ago (whose parity was lost) must not count.
+        self.fec_received = {s: (t, w) for s, (t, w) in self.fec_received.items()
+                             if self.now - t < FEC_MEMORY_S}
+        group = [(pkt.seq + i) % (1 << config.SEQ_BITS) for i in range(self.fec_group)]
+        present = [self.fec_received[s][1] for s in group if s in self.fec_received]
+        if len(present) == self.fec_group - 1:
+            self.stats["fec_recovered"] += 1
+            self._on_forward(fec.recover(pkt.parity, present))
+        for s in group:
+            self.fec_received.pop(s, None)
 
     def _send_snapshot(self):
         """B3: pack the whole state as one DATA packet, split it into MTU-sized
@@ -320,6 +380,11 @@ class Simulation:
 
     def _on_forward(self, wire):
         pkt = header.unpack(wire)
+        if header.is_parity(pkt.type, pkt.bitmap, pkt.fec):
+            self._on_parity(pkt)
+            return
+        if self.policy == "fec" and pkt.type == header.DATA:
+            self.fec_received[pkt.seq] = (self.now, wire)
         if pkt.type == header.SKIP and pkt.fec == header.HB_MARK:
             self._on_digest(pkt)
             return
@@ -348,7 +413,7 @@ class Simulation:
             if obsolete_ids:
                 text += f"; already had newer [{names(obsolete_ids)}]"
             self._log(pkt.seq, "REPAIR", text)
-        elif self.policy in ("ours", "arq"):
+        elif self.policy in NACKING:
             for seq in self.gaps.on_data(pkt.seq, pkt.updates):
                 self._log(seq, "GAP", f"receiver detects seq {seq} never arrived")
                 self._push(self.now + self.hold_down_s, TIMER, seq)

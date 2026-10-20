@@ -1,3 +1,4 @@
+PASS  False suppressions = 0 with selective repetition
 PASS  False suppressions = 0
 PASS  No field below T* is ever repaired
 PASS  No critical field is ever suppressed as superseded

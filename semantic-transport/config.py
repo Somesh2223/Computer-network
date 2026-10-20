@@ -23,3 +23,9 @@ SEQ_BITS = 14
 VERSION_BITS = 8
 HEADER_BYTES = 5
 MTU = 1500                         # B3 (snapshot) fragments above this
+
+# --- forward error correction (Phase 8) -------------------------------------
+REPETITIONS = 2                    # ours_fec: a small critical field rides in k more packets
+REPETITION_MAX_WIDTH = 16          # ...if it is at most this many bytes
+REPETITION_SPACING = 5             # packets between copies: more than a typical loss burst
+FEC_GROUP = 15                     # B2: data packets per XOR parity packet (4-bit index caps it)

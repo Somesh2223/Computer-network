@@ -1,6 +1,7 @@
 """Experiments: sweeps, figures and CSVs. Five seeds per point, 95 % confidence intervals.
 
-  python experiments.py
+  python experiments.py                 all studies (about 12 minutes)
+  python experiments.py fec workload    just the named studies
 
 Writes everything to results/. Numbers are findings, not targets: nothing here
 is tuned to reproduce a figure written down earlier.
@@ -9,22 +10,24 @@ is tuned to reproduce a figure written down earlier.
   2. policy comparison     - ours vs B1 / B3 / B4: recovery bytes and freshness
   3. per-field table       - Age of Information of each field under each policy
   4. workload sensitivity  - how the saving depends on the byte-weight of fast fields
-  5. invariants            - the hard checks of BUILD_PROMPT §11, over all runs
+  5. fec                   - selective repetition vs blanket FEC (B2) at matched bytes
+  6. invariants            - the hard checks of BUILD_PROMPT §11, over all runs
 """
 
 import csv
 import math
 import os
 import statistics
+import sys
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import config
-from src import schema
+from src import fec, schema
 from src.crossover import crossover
-from src.metrics import verify_no_false_suppression
+from src.metrics import on_time_rate, verify_no_false_suppression
 from src.schema import DEFAULT_FIELDS, Field
 from src.sim import Simulation
 from src.supersession import Outcome
@@ -229,10 +232,93 @@ def workload_sweep():
     return rows
 
 
-# --- 5. invariants -------------------------------------------------------------
+# --- 5. selective FEC vs blanket FEC ---------------------------------------------
 
-def check_invariants(policy_runs, field_runs):
+def fec_study(duration_s=180.0):
+    """Does spending a few bytes on repetition of small critical fields beat spending
+    the same bytes on uniform parity (B2)? Scored by the share of critical-field
+    updates delivered within their deadline, at RTTs where reactive repair gets slow."""
+    critical = [f for f in schema.active() if fec.is_critical(f)]
+    names = {"udp": "B4 plain UDP", "ours": "Ours", "ours_fec": "Ours + repetition",
+             "b2_matched": "B2 at matched bytes", "b2_full": "B2 every group"}
+    rows, runs_ours_fec = [], []
+    for rtt in (0.060, 0.300, 0.600):
+        per = {k: [] for k in names}
+        for seed in config.SEEDS:
+            sims = {p: Simulation(seed, p, rtt_s=rtt, duration_s=duration_s).run()
+                    for p in ("udp", "ours", "ours_fec")}
+            sims["b2_full"] = Simulation(seed, "fec", rtt_s=rtt, duration_s=duration_s).run()
+            # Matched: give B2 the same extra bytes ours_fec spends over plain UDP, by
+            # sending parity for only every n-th group.
+            budget = sims["ours_fec"].metrics.wire_bytes - sims["udp"].metrics.wire_bytes
+            every = max(1, round(sims["b2_full"].stats["parity_bytes"] / budget))
+            sims["b2_matched"] = Simulation(seed, "fec", rtt_s=rtt, duration_s=duration_s,
+                                            fec_every=every).run()
+            runs_ours_fec.append(sims["ours_fec"])
+            base = sims["udp"].metrics.wire_bytes
+            for key, sim in sims.items():
+                per[key].append(dict(
+                    extra=sim.metrics.wire_bytes - base,
+                    on_time=100 * on_time_rate(critical, sim.generated, sim.deliveries, sim.gen_time,
+                                               config.WARMUP_S, duration_s),
+                    aoi=sim.metrics.mean_aoi_all()))
+        for key, label in names.items():
+            row = dict(rtt_ms=round(rtt * 1000), policy=label)
+            for metric in ("extra", "on_time", "aoi"):
+                m, h = mean_ci([r[metric] for r in per[key]])
+                row[metric], row[metric + "_ci95"] = round(m, 4), round(h, 4)
+            rows.append(row)
+        print(f"  fec study at RTT {rtt*1000:.0f} ms done")
+    write_csv("fec_study.csv", rows)
+
+    fig, (left, right) = plt.subplots(1, 2, figsize=(11, 4.6), facecolor=SURFACE,
+                                      gridspec_kw=dict(width_ratios=[1.5, 1]))
+    order = list(names.values())
+    shades = {"Ours + repetition": ACCENT, "Ours": "#7fb0ea", "B4 plain UDP": GREY,
+              "B2 at matched bytes": "#c9c8c2", "B2 every group": "#6f6e69"}
+    # Dots with CI whiskers, not bars: the differences live in the top few percent,
+    # and a bar's length would have to start at zero to be honest.
+    offset = 0.13
+    rtts = sorted({r["rtt_ms"] for r in rows})
+    for i, label in enumerate(order):
+        pts = [next(r for r in rows if r["rtt_ms"] == t and r["policy"] == label) for t in rtts]
+        xs = [j + (i - 2) * offset for j in range(len(rtts))]
+        left.errorbar(xs, [r["on_time"] for r in pts], yerr=[r["on_time_ci95"] for r in pts],
+                      fmt="o", markersize=7, color=shades[label], label=label, capsize=3,
+                      elinewidth=1.2, markeredgecolor=SURFACE)
+    left.set_xticks(range(len(rtts)), [f"RTT {t} ms" for t in rtts])
+    left.set_xlim(-0.5, len(rtts) - 0.5)
+    left.set_ylabel("critical updates on time (%)", color=INK_2)
+    style(left, "Critical-field updates delivered within their deadline",
+          f"10% burst loss, {duration_s:.0f} s runs, 5 seeds, 95% CI")
+    left.legend(frameon=False, fontsize=8, labelcolor=INK, ncol=3, loc="upper center",
+                bbox_to_anchor=(0.5, -0.1))
+    spenders = [label for label in order if label != "B4 plain UDP"]     # UDP is the zero baseline
+    at60 = [next(r for r in rows if r["rtt_ms"] == 60 and r["policy"] == label) for label in spenders]
+    # Dots, not bars: on a log axis a bar's length would not be its value.
+    right.scatter([r["extra"] for r in at60], spenders, s=60, color=[shades[l] for l in spenders], zorder=3)
+    right.set_xscale("log")
+    right.set_xlim(1e4, 1e7)
+    right.set_ylim(len(spenders) - 0.5, -0.5)
+    for i, r in enumerate(at60):
+        right.text(r["extra"], i, f"  {r['extra']:,.0f} B", va="center", fontsize=8, color=INK)
+    right.set_xlabel("extra bytes on the wire vs plain UDP (log scale)", color=INK_2)
+    style(right, "What each policy spends", "RTT 60 ms, per 180 s run")
+    right.grid(axis="x", color=GRID, linewidth=0.8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "fig_fec.png"), dpi=160)
+    plt.close(fig)
+    return rows, runs_ours_fec
+
+
+# --- 6. invariants -------------------------------------------------------------
+
+def check_invariants(policy_runs, field_runs, fec_runs=()):
     checks = []
+    if fec_runs:
+        checks.append(("False suppressions = 0 with selective repetition",
+                       all(verify_no_false_suppression(s.suppression_events, s.transmissions) == 0
+                           for s in fec_runs)))
     ours_all = policy_runs["ours"] + field_runs["ours"]
     checks.append(("False suppressions = 0",
                    all(verify_no_false_suppression(s.suppression_events, s.transmissions) == 0
@@ -265,15 +351,31 @@ def check_invariants(policy_runs, field_runs):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    print("1/4 crossover sweep")
-    cross = crossover_sweep()
-    print("2/4 policy comparison")
+    wanted = set(sys.argv[1:]) or {"crossover", "policy", "fields", "workload", "fec"}
+    if "crossover" in wanted:
+        print("crossover sweep")
+        crossover_sweep()
+    if "workload" in wanted:
+        print("workload sweep")
+        workload = workload_sweep()
+        print("Workload sensitivity: " + ", ".join(f"{r['lidar_width_b']} B -> {r['saving_pct']}%"
+                                                   for r in workload))
+    fec_runs = ()
+    if "fec" in wanted:
+        print("fec study")
+        rows, fec_runs = fec_study()
+        print("\nSelective repetition vs blanket FEC (180 s, 10% burst loss, 5 seeds)")
+        for r in rows:
+            print(f"  RTT {r['rtt_ms']:>3} ms  {r['policy']:<20} extra {r['extra']:>11,.0f} B"
+                  f"   critical on time {r['on_time']:6.2f} ± {r['on_time_ci95']:.2f} %   AoI {r['aoi']:.3f} s")
+    if not {"policy", "fields"} <= wanted:
+        print(f"\nWrote results to {OUT}/ (invariants need the policy and fields studies)")
+        return
+    print("policy comparison")
     policy_runs, summary = policy_comparison()
-    print("3/4 per-field table")
+    print("per-field table")
     field_runs, fields = per_field_table()
-    print("4/4 workload sweep")
-    workload = workload_sweep()
-    ok, lines = check_invariants(policy_runs, field_runs)
+    ok, lines = check_invariants(policy_runs, field_runs, fec_runs)
 
     print("\nPolicy comparison (10% burst loss, 30 s, 5 seeds, mean ± 95% CI)")
     for r in summary:
@@ -287,7 +389,6 @@ def main():
         print(f"  {r['field']:<12} {str(r['period_ms']):>6} {r['vs_t_star']:>5}  ours {r['aoi_ours_s']:.4f}"
               f"  arq {r['aoi_arq_s']:.4f}  udp {r['aoi_udp_s']:.4f}   superseded {r['superseded']:>4}"
               f"  tolerance {r['within_tolerance']:>4}  repaired {r['repair']:>3}")
-    print("\nWorkload sensitivity: " + ", ".join(f"{r['lidar_width_b']} B -> {r['saving_pct']}%" for r in workload))
     print("\nInvariants: " + ("ALL PASS" if ok else "FAILURES - see results/invariants.txt"))
     for line in lines:
         if line.startswith("FAIL"):
