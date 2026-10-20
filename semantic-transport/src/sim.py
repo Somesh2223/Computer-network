@@ -3,6 +3,10 @@
 Every packet really goes through header.pack() / unpack(); only time and the
 network are pretend. Events live in a heap of (time, tie, kind, data).
 
+The protocol code here is also what runs over real sockets: udp_driver.py hands
+in a `link`, and packets that survive the loss model go to a real UDP socket
+instead of back onto the heap. Nothing else changes.
+
 Policies:
   "ours"      per-field supersession + tolerance, plus the liveness heartbeat
   "arq"       B1 - the sender resends EVERY field of a lost packet, in full
@@ -47,11 +51,13 @@ class Simulation:
                  hold_down_s=config.HOLD_DOWN_S, rtt_s=config.RTT_S,
                  jitter_s=config.JITTER_S, burst=config.BURST,
                  mean_burst_len=config.MEAN_BURST_LEN,
-                 heartbeat_s=config.HEARTBEAT_S, warmup_s=config.WARMUP_S, trace=False):
+                 heartbeat_s=config.HEARTBEAT_S, warmup_s=config.WARMUP_S, trace=False,
+                 link=None):
         self.policy = policy
         self.duration_s, self.tick_s = duration_s, tick_s
         self.hold_down_s, self.rtt_s, self.jitter_s = hold_down_s, rtt_s, jitter_s
         self.heartbeat_s = heartbeat_s
+        self.link = link             # None = simulated link (the heap); else a real socket
 
         self.generator = Generator(random.Random(seed + 1))
         self.fwd_data = random.Random(seed + 2)
@@ -83,6 +89,10 @@ class Simulation:
         # Freshness is measured from when a value was generated. The receiver can't
         # know that in a real deployment; the simulator can, so it keeps the record.
         self.gen_time = {}             # (field id, version) -> generation time
+        # The same facts as plain logs, for when sender and receiver are separate
+        # processes (udp_driver.py) and freshness is worked out afterwards.
+        self.generated = []            # (time, field id, version) at the sender
+        self.deliveries = []           # (time, field id, version, bytes) applied at the receiver
         self.metrics = Metrics([f.id for f in schema.active()], warmup_s, duration_s)
 
         self.stats = dict(data_sent=0, data_lost=0, data_bytes=0,
@@ -111,26 +121,47 @@ class Simulation:
         if self.trace is not None:
             self.trace.append((self.now, seq, kind, text))
 
-    def run(self):
+    def start(self):
+        """The sender's first events: the first tick, and the first heartbeat."""
         self._push(0.0, TICK)
         if self.policy == "ours":
             self._push(self.heartbeat_s, HEARTBEAT)
+
+    def handle(self, kind, data):
+        if kind == TICK:
+            self._on_tick()
+        elif kind == FWD:
+            self._on_forward(data)
+        elif kind == TIMER:
+            self._on_timer(data)
+        elif kind == REV:
+            self._on_nack(data)
+        elif kind == HEARTBEAT:
+            self._on_heartbeat()
+
+    def next_event_time(self):
+        return self._heap[0][0] if self._heap else None
+
+    def pop_event(self):
+        """(time, tie, kind, data) of the earliest pending event."""
+        return heapq.heappop(self._heap)
+
+    def run(self):
+        self.start()
         while self._heap:          # runs until the last in-flight packet has landed
             self.now, _, kind, data = heapq.heappop(self._heap)
-            if kind == TICK:
-                self._on_tick()
-            elif kind == FWD:
-                self._on_forward(data)
-            elif kind == TIMER:
-                self._on_timer(data)
-            elif kind == REV:
-                self._on_nack(data)
-            elif kind == HEARTBEAT:
-                self._on_heartbeat()
+            self.handle(kind, data)
         self.metrics.finish()
         return self
 
     # --- links ----------------------------------------------------------------
+
+    def _deliver(self, kind, wire, delay):
+        """A packet survived the loss model. FWD goes to the receiver, REV to the sender."""
+        if self.link is None:
+            self._push(self.now + delay, kind, wire)    # simulated link
+        else:
+            self.link.send(kind, wire, delay)           # real UDP socket (udp_driver.py)
 
     def _send_ctrl(self, wire):
         """Forward control channel (repairs, skips, heartbeats). Returns True if lost."""
@@ -138,7 +169,7 @@ class Simulation:
         lost = self.ctrl_loss.drops()
         delay = self.rtt_s / 2 + self.fwd_ctrl.uniform(0, self.jitter_s)
         if not lost:
-            self._push(self.now + delay, FWD, wire)
+            self._deliver(FWD, wire, delay)
         return lost
 
     def _send_rev(self, wire):
@@ -147,7 +178,7 @@ class Simulation:
         lost = self.rev_loss.drops()
         delay = self.rtt_s / 2 + self.rev.uniform(0, self.jitter_s)
         if not lost:
-            self._push(self.now + delay, REV, wire)
+            self._deliver(REV, wire, delay)
         return lost
 
     # --- sender ---------------------------------------------------------------
@@ -156,6 +187,7 @@ class Simulation:
         updates = self.generator.due(self.now)
         for fid, (version, _) in updates.items():
             self.gen_time[(fid, version)] = self.now
+            self.generated.append((self.now, fid, version))
         if self.policy == "snapshot":
             self.latest_sent.update(updates)
             if self.latest_sent:
@@ -181,7 +213,7 @@ class Simulation:
             self.stats["data_lost"] += 1
             self._log(seq, "LOST", f"seq {seq} carrying [{names(updates)}]")
         else:
-            self._push(self.now + delay, FWD, wire)
+            self._deliver(FWD, wire, delay)
 
     def _send_snapshot(self):
         """B3: pack the whole state as one DATA packet, split it into MTU-sized
@@ -203,7 +235,7 @@ class Simulation:
         if lost:
             self.stats["data_lost"] += 1
         else:
-            self._push(self.now + delay, FWD, wire)
+            self._deliver(FWD, wire, delay)
 
     def _on_nack(self, wire):
         nack = header.unpack(wire)
@@ -298,7 +330,9 @@ class Simulation:
         for fid, (version, value) in pkt.updates.items():
             if self.receiver.apply(fid, version, value):
                 applied_ids.append(fid)
-                self.metrics.on_delivered(fid, self.now, self.gen_time[(fid, version)], len(value))
+                self.deliveries.append((self.now, fid, version, len(value)))
+                if (fid, version) in self.gen_time:     # always, unless sender is another process
+                    self.metrics.on_delivered(fid, self.now, self.gen_time[(fid, version)], len(value))
             else:
                 obsolete_ids.append(fid)
         if pkt.type == header.REPAIR and pkt.fec == header.HB_MARK:

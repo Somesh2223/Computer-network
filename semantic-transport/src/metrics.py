@@ -4,6 +4,7 @@ Everything is kept in memory and only written out at teardown (flush_csv):
 writing to disk inside the receive path would contaminate the latency figures.
 """
 
+import bisect
 import csv
 from collections import deque
 
@@ -88,6 +89,29 @@ class Metrics:
             w = csv.writer(fh)
             w.writerow(["time_s", "event", "field_id", "value"])
             w.writerows(self.ring)
+
+
+def replay(field_ids, generated, deliveries, warmup_s, end_s, wire_bytes):
+    """Freshness from two separate logs, for when sender and receiver are separate
+    processes (udp_driver.py). Both logs use the same monotonic clock.
+
+    generated:  (time, field id, version) at the sender
+    deliveries: (time, field id, version, bytes) applied at the receiver
+    Versions wrap every 256 updates, so a delivery is matched to the latest
+    generation of that (field, version) at or before it arrived.
+    """
+    born = {}
+    for t, fid, version in generated:
+        born.setdefault((fid, version), []).append(t)
+    m = Metrics(field_ids, warmup_s, end_s)
+    m.wire_bytes = wire_bytes
+    for t, fid, version, nbytes in sorted(deliveries):
+        times = born.get((fid, version), [])
+        i = bisect.bisect_right(times, t) - 1
+        if i >= 0:
+            m.on_delivered(fid, t, times[i], nbytes)
+    m.finish()
+    return m
 
 
 def _percentile(samples, q):
