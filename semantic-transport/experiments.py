@@ -343,35 +343,35 @@ def realnet_figure():
     fig, (left, right) = plt.subplots(1, 2, figsize=(11, 4.6), facecolor=SURFACE)
     colours = {"Ours": ACCENT, "Ours + repetition": "#7fb0ea", "B1 full ARQ": GREY,
                "B4 plain UDP": "#c9c8c2", "Kernel TCP": SECOND}
-    names = [r["policy"] for r in summary]
-    # Dots with CI, log scale: TCP's latency is orders of magnitude above the rest.
-    left.errorbar(range(len(summary)), [r["latency_p99_ms"] for r in summary],
-                  yerr=[r["latency_p99_ms_ci95"] for r in summary], fmt="none", ecolor=INK_2, capsize=3)
-    left.scatter(range(len(summary)), [r["latency_p99_ms"] for r in summary], s=70, zorder=3,
-                 color=[colours[n] for n in names])
-    for i, r in enumerate(summary):
-        left.text(i + 0.12, r["latency_p99_ms"], f"{r['latency_p99_ms']:,.0f} ms", fontsize=8,
-                  color=INK, va="center")
+    # Every run is a dot and the median a bar: TCP's runs spread over two orders of
+    # magnitude, so a mean +/- CI would reach below zero, which a log axis can't show.
+    for i, (policy, label) in enumerate(REALNET_LABEL.items()):
+        vals = sorted(float(r["latency_p99_ms"]) for r in runs if r["policy"] == policy)
+        left.scatter([i] * len(vals), vals, s=36, color=colours[label], alpha=0.8, zorder=3)
+        med = statistics.median(vals)
+        left.hlines(med, i - 0.15, i + 0.15, color=INK, linewidth=2, zorder=4)
+        left.text(i + 0.18, med * 1.18, f"{med:,.0f} ms", fontsize=8, color=INK, va="center")
     left.set_yscale("log")
-    left.set_xticks(range(len(names)), names, rotation=15)
+    left.set_xticks(range(len(REALNET_LABEL)), list(REALNET_LABEL.values()), rotation=15)
+    left.set_xlim(-0.5, len(REALNET_LABEL) - 0.2)
     left.set_ylabel("p99 freshness latency (ms, log scale)", color=INK_2)
     style(left, "Worst-case delay of fresh state, real kernel under netem",
-          "10% burst loss, RTT 60 ms, 30 s runs, 5 seeds, 95% CI")
+          "10% burst loss, RTT 60 ms, 30 s runs; dots = runs (5 seeds), bar = median")
     for policy, colour in (("ours", ACCENT), ("udp", GREY), ("tcp", SECOND)):
-        pts = []
-        for loss in sorted({float(r["loss"]) for r in sweep}):
+        losses = sorted({float(r["loss"]) for r in sweep})
+        meds = []
+        for loss in losses:
             vals = [float(r["latency_p99_ms"]) for r in sweep
                     if r["policy"] == policy and float(r["loss"]) == loss]
-            m, h = mean_ci(vals)
-            pts.append((100 * loss, m, h))
-        right.errorbar([x for x, _, _ in pts], [m for _, m, _ in pts], yerr=[h for _, _, h in pts],
-                       color=colour, marker="o", markersize=5, linewidth=2, capsize=3,
-                       label=REALNET_LABEL[policy])
+            right.scatter([100 * loss] * len(vals), vals, s=22, color=colour, alpha=0.55, zorder=3)
+            meds.append(statistics.median(vals))
+        right.plot([100 * x for x in losses], meds, color=colour, marker="o", markersize=5,
+                   linewidth=2, label=REALNET_LABEL[policy], zorder=4)
     right.set_yscale("log")
     right.set_xlabel("i.i.d. loss rate (%)", color=INK_2)
     right.set_ylabel("p99 freshness latency (ms, log scale)", color=INK_2)
     style(right, "Tail latency against loss rate, real kernel under netem",
-          "i.i.d. loss, RTT 60 ms, 20 s runs, 3 seeds, 95% CI")
+          "i.i.d. loss, RTT 60 ms, 20 s runs; dots = runs (3 seeds), line = median")
     right.legend(frameon=False, fontsize=9, labelcolor=INK)
     fig.tight_layout()
     fig.savefig(os.path.join(OUT, "fig_realnet.png"), dpi=160)
