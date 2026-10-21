@@ -57,6 +57,8 @@ button, select, input { font: inherit; color: inherit; }
 
 .nav { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper); border-bottom: 1px solid var(--rule); }
 .nav .wrap { display: flex; gap: 18px; align-items: center; padding-block: 10px; overflow-x: auto; }
+.nav .wrap { scrollbar-width: none; }
+.nav .wrap::-webkit-scrollbar { display: none; }
 .nav b { font-family: var(--display); font-size: 17px; white-space: nowrap; }
 .nav a { font-family: var(--mono); font-size: 12px; text-decoration: none; color: var(--ink-2); white-space: nowrap; }
 .nav a:hover { color: var(--signal); }
@@ -246,7 +248,7 @@ footer { padding-block: 32px 48px; font-size: 13px; color: var(--ink-2); }
     <div class="controls">
       <span class="live-badge" id="live-badge">checking for live mode…</span>
       <label class="muted" for="preset" style="font-size:14px">Start from</label>
-      <select id="preset" class="btn ghost" style="padding:6px 10px"></select>
+      <select id="preset" class="btn ghost" style="padding:6px 10px;max-width:100%;min-width:0"></select>
     </div>
     <div class="notice" id="live-note" hidden></div>
     <div class="panel tablebox" style="margin-top:14px">
@@ -298,11 +300,14 @@ footer { padding-block: 32px 48px; font-size: 13px; color: var(--ink-2); }
     </div>
     <div class="controls">
       <button class="btn" type="button" id="rp-play">Play</button>
+      <button class="btn ghost" type="button" id="rp-nextloss">Next loss, in slow motion</button>
       <div class="seg" role="group" aria-label="Speed" id="rp-speed"></div>
       <span class="mono muted" id="rp-clock">t = 0.00 s</span>
     </div>
     <input type="range" id="rp-scrub" min="0" max="15" step="0.01" value="4.5" aria-label="Replay position in seconds">
     <div class="replay-top" style="margin-top:14px">
+      <div class="panel svgbox"><svg id="linkview" viewBox="0 0 900 250" role="img" aria-label="Packets travelling between the drone and the ground station: data, lost packets, NACKs and replies"></svg></div>
+      <p class="caption" id="link-caption" style="margin-top:0;min-height:1.6em"></p>
       <div class="panel svgbox"><svg id="ribbon" viewBox="0 0 900 124" role="img" aria-label="Data packets in the last second: delivered or lost"></svg></div>
       <div class="policy-cols" id="pcols"></div>
       <div class="panel ticker" id="ticker"></div>
@@ -616,7 +621,9 @@ const Replay = (function () {
   const POL = [['ours', 'Ours'], ['arq', 'B1 full ARQ'], ['udp', 'B4 plain UDP']];
   const ribbon = document.getElementById('ribbon'), cols = document.getElementById('pcols');
   const playBtn = document.getElementById('rp-play'), scrub = document.getElementById('rp-scrub');
-  let t = 4.5, playing = false, speed = 1, last = null, ui = {}, SHOW = [], big = null;
+  let t = 4.5, playing = false, speed = 0.25, last = null, ui = {}, SHOW = [], big = null;
+  let flights = [], verdicts = [];
+  const linkSvg = document.getElementById('linkview'), linkCap = document.getElementById('link-caption');
   const AGE_MAX = 12;
   const ageScale = a => Math.min(100, Math.sqrt(Math.max(0, a) / AGE_MAX) * 100);   // square root keeps short ages visible
   function lastBefore(arr, x) { let lo = 0, hi = arr.length - 1, ans = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m][0] <= x) { ans = m; lo = m + 1; } else hi = m - 1; } return ans; }
@@ -646,7 +653,87 @@ const Replay = (function () {
     }
     scrub.max = DATA.window;
     t = Math.min(4.5, DATA.window / 2);
+    buildFlights();
     render();
+  }
+
+  // Everything that crosses the link in our run, as flights from t0 to t1.
+  // DATA times are send times; SKIP/REPAIR events are arrivals; NACK events are sends.
+  function buildFlights() {
+    const ow = DATA.config.rtt / 2, run = DATA.runs.ours, bigBit = 1 << big.id;
+    flights = [];
+    for (const [st, seq, mask, lost] of run.sends) {
+      flights.push({ t0: st, t1: st + ow, dir: 1, lane: 0, lost: !!lost, tall: (mask & bigBit) !== 0, label: lost ? `seq ${seq}` : '', cls: lost ? 'loss' : 'ink2' });
+    }
+    for (const [et, seq, kind] of run.events) {
+      if (kind === 'NACK') flights.push({ t0: et, t1: et + ow, dir: -1, lane: 2, lost: false, label: `NACK ${seq}`, cls: 'ink' });
+      else if (kind === 'NACK_LOST') flights.push({ t0: et, t1: et + ow, dir: -1, lane: 2, lost: true, label: `NACK ${seq}`, cls: 'ink' });
+      else if (kind === 'SKIP') flights.push({ t0: et - ow, t1: et, dir: 1, lane: 1, lost: false, label: 'SKIP 5 B', cls: 'ink2' });
+      else if (kind === 'REPAIR') flights.push({ t0: et - ow, t1: et, dir: 1, lane: 1, lost: false, label: 'REPAIR', cls: 'ours' });
+      else if (kind === 'REPLY_LOST') flights.push({ t0: et, t1: et + ow, dir: 1, lane: 1, lost: true, label: 'reply', cls: 'ink2' });
+    }
+    flights.sort((a, b) => a.t0 - b.t0);
+    verdicts = run.decisions.map(([dt, seq, fid, o]) => ({ t: dt, seq, text: `${fname(fid)}: ${VERDICT[o]}`, o }));
+  }
+
+  const LANES = [96, 140, 184];            // data, replies, NACKs
+  const SX = 168, RX = 732;
+  function drawLink(now) {
+    clear(linkSvg); arrowDefs(linkSvg);
+    const ow = DATA.config.rtt / 2, linger = Math.max(ow, 0.03);
+    // the two ends and the lanes
+    el('rect', { x: 20, y: 54, width: 130, height: 160, rx: 6, class: 'f-panel s-ink', 'stroke-width': 1.5 }, linkSvg);
+    el('rect', { x: 750, y: 54, width: 130, height: 160, rx: 6, class: 'f-panel s-ink', 'stroke-width': 1.5 }, linkSvg);
+    el('text', { x: 85, y: 44, 'text-anchor': 'middle', 'font-size': 12, class: 'f-ink2' }, linkSvg, 'SENDER');
+    el('text', { x: 815, y: 44, 'text-anchor': 'middle', 'font-size': 12, class: 'f-ink2' }, linkSvg, 'RECEIVER');
+    for (const [y, lab] of [[LANES[0], 'DATA →'], [LANES[1], 'SKIP / REPAIR →'], [LANES[2], '← NACK']]) {
+      el('line', { x1: SX, y1: y, x2: RX, y2: y, class: 's-rule', 'stroke-dasharray': '3 5' }, linkSvg);
+      el('text', { x: 450, y: y - 10, 'text-anchor': 'middle', 'font-size': 10.5, class: 'f-ink2', opacity: 0.8 }, linkSvg, lab);
+    }
+    el('text', { x: 450, y: 22, 'text-anchor': 'middle', 'font-size': 11.5, class: 'f-ink2' }, linkSvg,
+       `one-way delay ${Math.round(ow * 1000)} ms · showing t = ${now.toFixed(3)} s`);
+    // flights in the air (or just lost)
+    const from = now - ow - linger;
+    let lo = 0, hi = flights.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (flights[m].t0 < from) lo = m + 1; else hi = m; }
+    const dropped = [0, 0, 0];             // lost packets shown per lane, so their marks don't stack
+    labelled = [-1e9, -1e9, -1e9];         // x of the last label per lane: close packets share one
+    for (let i = lo; i < flights.length && flights[i].t0 <= now; i++) {
+      const f = flights[i], y = LANES[f.lane];
+      const frac = (now - f.t0) / (f.t1 - f.t0);
+      const xAt = q => f.dir > 0 ? SX + q * (RX - SX) : RX - q * (RX - SX);
+      if (f.lost) {
+        if (frac <= 0.5) drawPacket(xAt(frac), y, f);
+        else if (now - f.t0 - (f.t1 - f.t0) / 2 <= linger) {
+          const k = dropped[f.lane]++, x = xAt(0.5) + (f.dir > 0 ? -1 : 1) * k * 74;
+          el('text', { x, y: y + 6, 'text-anchor': 'middle', 'font-size': 18, class: 'f-loss', 'font-weight': 600 }, linkSvg, '✗');
+          if (f.label) el('text', { x, y: y + 24, 'text-anchor': 'middle', 'font-size': 10.5, class: 'f-loss' }, linkSvg, `${f.label} lost`);
+        }
+      } else if (frac <= 1) drawPacket(xAt(frac), y, f);
+    }
+    // the sender's verdicts, shown briefly where they are made
+    const recent = verdicts.filter(v => v.t <= now && now - v.t <= Math.max(linger * 3, 0.1)).slice(-3);
+    recent.forEach((v, j) => {
+      el('rect', { x: 26, y: 62 + j * 46, width: 118, height: 40, rx: 3, class: `f-paper s-${VCLASS[v.o]}`, 'stroke-width': 1.5 }, linkSvg);
+      el('text', { x: 32, y: 78 + j * 46, 'font-size': 10, class: 'f-ink' }, linkSvg, v.text.split(':')[0].slice(0, 17));
+      el('text', { x: 32, y: 94 + j * 46, 'font-size': 10, class: `f-${VCLASS[v.o]}`, 'font-weight': 600 }, linkSvg, v.text.split(': ')[1]);
+    });
+    if (!recent.length) {
+      el('text', { x: 85, y: 130, 'text-anchor': 'middle', 'font-size': 11, class: 'f-ink2' }, linkSvg, 'drone');
+      el('text', { x: 85, y: 146, 'text-anchor': 'middle', 'font-size': 10.5, class: 'f-ink2' }, linkSvg, 'decisions appear here');
+    }
+    el('text', { x: 815, y: 130, 'text-anchor': 'middle', 'font-size': 11, class: 'f-ink2' }, linkSvg, 'ground station');
+    const v = recent[recent.length - 1];
+    linkCap.textContent = v ? `Sender decided on lost seq ${v.seq}: ${v.text}.` : 'Data packets stream every 10 ms. Press "Next loss" to watch one lost packet being handled.';
+  }
+  let labelled = [-1e9, -1e9, -1e9];
+  function drawPacket(x, y, f) {
+    const h = f.tall ? 22 : 12;
+    el('rect', { x: x - 6, y: y - h / 2, width: 12, height: h, rx: 2, class: `f-${f.cls}` }, linkSvg);
+    if (f.label && f.lane !== 0 && Math.abs(x - labelled[f.lane]) > 72) {
+      el('text', { x, y: y - h / 2 - 4, 'text-anchor': 'middle', 'font-size': 10.5, class: `f-${f.cls}` }, linkSvg, f.label);
+      labelled[f.lane] = x;
+    }
   }
   const SPAN = 1.2;
   function drawRibbon(now) {
@@ -679,7 +766,7 @@ const Replay = (function () {
   function render() {
     document.getElementById('rp-clock').textContent = `t = ${t.toFixed(2)} s of ${DATA.window} s`;
     scrub.value = t;
-    drawRibbon(t); drawTicker(t);
+    drawLink(t); drawRibbon(t); drawTicker(t);
     for (const [key] of POL) {
       ui[key].cnt.textContent = fmtInt(ctrlBytes(key, t));
       for (const f of SHOW) {
@@ -704,8 +791,17 @@ const Replay = (function () {
     playing = true; last = null; playBtn.textContent = 'Pause'; requestAnimationFrame(frame);
   });
   scrub.addEventListener('input', e => { t = +e.target.value; render(); });
+  document.getElementById('rp-nextloss').addEventListener('click', () => {
+    // jump to just before the next lost data packet and play it slowly
+    const next = DATA.runs.ours.sends.find(x => x[3] && x[0] > t + 0.02);
+    if (!next) return;
+    t = Math.max(0, next[0] - 0.02); speed = 0.05;
+    sp.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.textContent === '0.05×')));
+    render();
+    if (!playing && !REDUCED) { playing = true; last = null; playBtn.textContent = 'Pause'; requestAnimationFrame(frame); }
+  });
   const sp = document.getElementById('rp-speed');
-  for (const s of [0.25, 1, 4]) {
+  for (const s of [0.05, 0.25, 1, 4]) {
     const b = document.createElement('button'); b.type = 'button'; b.textContent = `${s}×`; b.setAttribute('aria-pressed', String(s === speed));
     b.addEventListener('click', () => { speed = s; press(sp, b); });
     sp.appendChild(b);
