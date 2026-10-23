@@ -620,7 +620,15 @@ const Replay = (function () {
   const AGE_MAX = 12;
   const ageScale = a => Math.min(100, Math.sqrt(Math.max(0, a) / AGE_MAX) * 100);   // square root keeps short ages visible
   function lastBefore(arr, x) { let lo = 0, hi = arr.length - 1, ans = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (arr[m][0] <= x) { ans = m; lo = m + 1; } else hi = m - 1; } return ans; }
-  function age(key, fid, now) { const fr = DATA.runs[key].fresh[fid] || []; const i = lastBefore(fr, now); return now - (i < 0 ? 0 : fr[i][1]); }
+  // How long the receiver has been missing the drone's newest value: 0 while it holds
+  // the latest one. (A rarely changing field is old but up to date; that is not late.)
+  function behind(key, fid, now) {
+    const fr = DATA.runs[key].fresh[fid] || [], i = lastBefore(fr, now), have = i < 0 ? -1 : fr[i][1];
+    const gs = DATA.gens[fid] || [];
+    let lo = 0, hi = gs.length;                       // first value generated after the one held
+    while (lo < hi) { const m = (lo + hi) >> 1; if (gs[m] > have) hi = m; else lo = m + 1; }
+    return lo < gs.length && gs[lo] <= now ? now - gs[lo] : 0;
+  }
   function ctrlBytes(key, now) { const c = DATA.runs[key].ctrl; const i = lastBefore(c, now); return i < 0 ? 0 : c[i][1]; }
   function rebuild() {
     playing = false; playBtn.textContent = 'Play';
@@ -632,7 +640,7 @@ const Replay = (function () {
     cols.innerHTML = ''; ui = {};
     for (const [key, label] of POL) {
       const c = document.createElement('div'); c.className = 'panel pcol';
-      c.innerHTML = `<h3>${label}</h3><div><div class="counter"></div><span class="muted" style="font-size:13px">bytes of recovery traffic so far</span></div><div class="gauges" style="display:flex;flex-direction:column;gap:6px"></div><span class="muted" style="font-size:12px">bar = age of the receiver's copy (square-root scale); black mark = the field's deadline; red = past it</span>`;
+      c.innerHTML = `<h3>${label}</h3><div><div class="counter"></div><span class="muted" style="font-size:13px">bytes of recovery traffic so far</span></div><div class="gauges" style="display:flex;flex-direction:column;gap:6px"></div><span class="muted" style="font-size:12px">bar = how long the receiver has been missing the newest value (square-root scale); mark = the field's deadline; red = past it</span>`;
       cols.appendChild(c);
       ui[key] = { cnt: c.querySelector('.counter'), g: {} };
       for (const f of SHOW) {
@@ -763,10 +771,10 @@ const Replay = (function () {
     for (const [key] of POL) {
       ui[key].cnt.textContent = fmtInt(ctrlBytes(key, t));
       for (const f of SHOW) {
-        const a = age(key, f.id, t), g = ui[key].g[f.id];
+        const a = behind(key, f.id, t), g = ui[key].g[f.id];
         g.fill.style.width = ageScale(a) + '%';
         g.fill.classList.toggle('late', a > f.deadline);
-        g.val.textContent = fmtMs(a);
+        g.val.textContent = a > 0 ? fmtMs(a) : 'up to date';
       }
     }
   }

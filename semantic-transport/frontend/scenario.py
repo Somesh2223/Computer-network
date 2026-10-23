@@ -83,7 +83,11 @@ def export_run(policy, seed, duration, loss, rtt, burst):
         superseded=sim.stats["fields_superseded"], tolerated=sim.stats["fields_tolerated"],
         repaired=sim.stats["fields_repaired"],
         false_suppressions=verify_no_false_suppression(sim.suppression_events, sim.transmissions))
-    return dict(sends=sends, events=events, decisions=decisions, ctrl=ctrl, fresh=fresh, summary=summary)
+    gens = {}                                       # field id -> generation times, oldest first
+    for t, fid, _ in sim.generated:
+        gens.setdefault(fid, []).append(r3(t))
+    return dict(sends=sends, events=events, decisions=decisions, ctrl=ctrl, fresh=fresh, summary=summary,
+                gens=gens)
 
 
 def pick_episodes(run):
@@ -113,6 +117,9 @@ def run_scenario(fields=None, seed=23, duration=15.0, loss=config.LOSS_RATE, rtt
     schema.use(fields if fields is not None else DEFAULT_FIELDS)
     try:
         runs = {p: export_run(p, seed, duration, loss, rtt, burst) for p in POLICIES}
+        gens = runs["ours"]["gens"]                  # the same sensors for every policy: keep one copy
+        for run in runs.values():
+            del run["gens"]
         seqs = list(episodes) if episodes else pick_episodes(runs["ours"])
         return dict(
             seed=seed, window=duration,
@@ -120,7 +127,7 @@ def run_scenario(fields=None, seed=23, duration=15.0, loss=config.LOSS_RATE, rtt
                         loss=loss, burst=burst, tstar=crossover(config.TICK_S, config.HOLD_DOWN_S, rtt)),
             fields=[dict(id=f.id, name=f.name, width=f.width, period=f.period, deadline=f.deadline,
                          mean_gap=f.mean_gap, critical=fec.is_critical(f)) for f in schema.active()],
-            runs=runs,
+            runs=runs, gens=gens,
             episodes=[episode(runs["ours"], s) for s in seqs],
             decisions_by_seq={str(s): [d for d in runs["ours"]["decisions"] if d[1] == s] for s in seqs})
     finally:
