@@ -9,8 +9,8 @@ also be protected in advance by spaced repetition.
 > TCP wastes bandwidth retransmitting data that's already out of date; UDP loses the rare important
 > data; we check, field by field, whether a lost value is still worth recovering.
 
-BCSE308P Computer Networks Laboratory, VIT Vellore, Fall 2026-27. Koliparthy Venkata Jahnvi
-(24BDS0132), Somesh Tripathi (24BCE0533), Anushka Jaiswal (24BCE2028).
+BCSE308P Computer Networks Laboratory, VIT Vellore, Fall 2026-27. Somesh Tripathi (24BCE0533),
+Koliparthy Venkata Jahnvi (24BDS0132), Anushka Jaiswal (24BCE2028).
 
 ## Quick start
 
