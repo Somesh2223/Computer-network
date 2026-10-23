@@ -20,10 +20,11 @@ Python 3.11+ with `pytest` and `matplotlib` (`pip install -r requirements.txt`).
 | --- | --- |
 | `python app.py` | The visual explorer in live mode at http://127.0.0.1:8000: type your own fields and link, press Run |
 | open `frontend/explorer.html` | The same explorer offline, showing the built-in drone run |
-| `python -m pytest -v` | 22 tests (protocol, decision engine, FEC, the set/get API) |
+| `python -m pytest -v` | 26 tests (protocol, decision engine, FEC, corruption, the set/get API) |
 | `python demo.py --seed 23` | Narrated demo: every verdict, the heartbeat, a summary |
 | `python demo.py --compare` | Ours vs full ARQ vs plain UDP on one loss trace |
 | `python experiments.py` | All simulator studies, CSVs and figures into `results/` (about 12 min) |
+| `python experiments.py errors` | Bit corruption and block FEC for large critical fields (about 1 min) |
 | `python3 udp_driver.py --policy ours` | Same code over real UDP sockets, two processes (Linux/WSL) |
 | `sudo python3 netem_bench.py` | Real kernel: our protocol and kernel TCP under tc/netem (about 35 min) |
 | `python experiments.py realnet` | Figure from the netem results |
@@ -68,6 +69,8 @@ python examples/plant_sender.py --loss 0.1          # then the sender
    - **REPAIR** otherwise. With nothing to repair it replies with a 5-byte SKIP.
 4. A heartbeat every second lists each field's latest version, so nothing stays stale when a NACK
    or a repair is lost.
+5. Bit corruption (`BIT_ERROR_RATE`) is caught by UDP's checksum and the packet dropped, so the
+   protocol handles it as one more loss.
 
 The NACK reaches the sender exactly tau + H + R after a loss, the same as the analytical crossover
 T* = tau + H + R (75 ms here). So the send-log check enforces the model by observation and can
@@ -81,14 +84,14 @@ never suppress a field's newest value.
 | `src/schema.py`, `src/header.py`, `src/generator.py` | Field table, wire format, sensor generator |
 | `src/send_log.py`, `src/supersession.py` | The sender's record and the decision engine |
 | `src/state_table.py`, `src/gap_detector.py` | Receiver replica and loss detection |
-| `src/fec.py` | Selective repetition and XOR parity (B2) |
+| `src/fec.py` | Selective repetition, selective block FEC, and XOR parity (B2) |
 | `src/sim.py` | Event harness: all policies, simulated clock and link |
 | `src/impairment.py`, `src/metrics.py`, `src/crossover.py` | Loss models, measurement, the model |
 | `udp_driver.py`, `tcp_ref.py`, `netem_bench.py` | Real sockets, kernel TCP, netem benchmark |
 | `semstate.py`, `examples/` | The set/get API for your own programs, and an example using it |
 | `app.py`, `frontend/` | The visual explorer: `build.py` bakes in real data, `scenario.py` runs your inputs |
 | `demo.py`, `experiments.py` | Narrated demo, studies and figures |
-| `tests/` | 22 tests |
+| `tests/` | 26 tests |
 | `results/` | Generated CSVs and figures |
 
 ## Policies compared
@@ -96,7 +99,7 @@ never suppress a field's newest value.
 | Name | Behaviour |
 | --- | --- |
 | `ours` | Supersession + tolerance + heartbeat |
-| `ours_fec` | Ours + spaced repetition of small critical fields |
+| `ours_fec` | Ours + spaced repetition of small critical fields, and block FEC for large critical fields whose repair would miss the deadline |
 | `arq` (B1) | Resend every field of a lost packet |
 | `fec` (B2) | One XOR parity packet per 15 data packets, for every field |
 | `snapshot` (B3) | Whole state every tick, fragmented over the MTU |

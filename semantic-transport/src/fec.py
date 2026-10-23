@@ -6,8 +6,15 @@ Two tools, used by two different policies:
    field - one the app cannot wait for, and which may not be sent again soon -
    rides again in k later data packets after it changes, as RTP's RFC 2198
    does for audio. A loss is then covered a few ticks later, with no round trip.
-   Big critical fields (terrain_map) are left to the reactive repair: repeating
-   1480 bytes k times would cost more than it saves.
+   Big critical fields (terrain_map) are not repeated: 1480 bytes k times would
+   cost more than it saves. They get block FEC instead (below).
+
+ * Selective block FEC (also "ours_fec", Review 1 objective 6). A LARGE critical
+   field whose reactive repair could not arrive before its deadline is protected
+   in advance: the packet carrying its new value and 2 later packets (spaced
+   apart, like the repeats) form a group, and one XOR parity packet covers it.
+   Any one lost packet of the group is rebuilt with no round trip. Fields whose
+   repair arrives in time anyway get nothing, so on a short link it costs nothing.
 
  * Blanket XOR parity (baseline B2). After every group of n data packets the
    sender sends one parity packet, the XOR of the group. Any ONE lost packet in
@@ -55,6 +62,36 @@ class Repeater:
             if fid in self.protected and self.k > 0:
                 self.owed[fid] = [self.k, self.spacing]
         return out
+
+
+def block_protected(fields, max_width, repair_delay):
+    """Large critical fields whose reactive repair (arriving repair_delay after a
+    loss) would miss their deadline: the only ones worth block FEC."""
+    return {f.id for f in fields if is_critical(f) and f.width > max_width and f.deadline < repair_delay}
+
+
+class BlockCoder:
+    """Groups each new value of a block-protected field with later packets for one parity.
+
+    Members are `spacing` packets apart, so one loss burst rarely takes two of them.
+    """
+
+    def __init__(self, protected, group, spacing):
+        self.protected, self.group, self.spacing = protected, group, spacing
+        self.open = []           # [[(seq, wire), ...], packets until the next member]
+
+    def sent(self, seq, wire, fields):
+        """Called for every DATA packet. Returns the groups now complete, each a list of (seq, wire)."""
+        for g in self.open:
+            g[1] -= 1
+            if g[1] == 0:
+                g[0].append((seq, wire))
+                g[1] = self.spacing
+        done = [g[0] for g in self.open if len(g[0]) == self.group]
+        self.open = [g for g in self.open if len(g[0]) < self.group]
+        if self.protected & set(fields):
+            self.open.append([[(seq, wire)], self.spacing])
+        return done
 
 
 def parity_of(wires):

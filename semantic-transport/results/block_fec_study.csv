@@ -1,0 +1,4 @@
+rtt_ms,policy,terrain_on_time_pct,terrain_on_time_pct_ci95,parity_bytes,parity_bytes_ci95,fec_recovered,fec_recovered_ci95,false_suppressions
+1500,B4 plain UDP,95.36,6.09,0,0.0,0,0.0,0
+1500,Ours,95.36,6.09,0,0.0,0,0.0,0
+1500,Ours + block FEC,98.82,3.27,36750.6,11040.3,9,2.48,0

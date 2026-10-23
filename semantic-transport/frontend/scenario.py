@@ -19,6 +19,7 @@ from src.supersession import Outcome             # noqa: E402
 
 OUTCOME_CODE = {Outcome.SUPERSEDED: "S", Outcome.WITHIN_TOLERANCE: "T", Outcome.REPAIR: "R"}
 POLICIES = ("ours", "arq", "udp")
+MAX_FIELD_BYTES = config.MTU - config.HEADER_BYTES - 1     # one packet: header + version byte + value
 
 
 def r3(x):
@@ -36,8 +37,8 @@ def fields_from_spec(spec):
             raise ValueError(f"Field {i + 1} needs a unique name.")
         names.add(name)
         size, deadline = int(f["size"]), float(f["deadline_ms"]) / 1000
-        if not 1 <= size <= 1400:
-            raise ValueError(f"{name}: size must be 1 to 1400 bytes.")
+        if not 1 <= size <= MAX_FIELD_BYTES:
+            raise ValueError(f"{name}: size must be 1 to {MAX_FIELD_BYTES} bytes, so it fits in one packet.")
         if not 0.001 <= deadline <= 120:
             raise ValueError(f"{name}: deadline must be between 1 ms and 120 s.")
         every = f.get("every_ms")

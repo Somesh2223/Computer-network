@@ -9,7 +9,8 @@ instead of back onto the heap. Nothing else changes.
 
 Policies:
   "ours"      per-field supersession + tolerance, plus the liveness heartbeat
-  "ours_fec"  ours + selective repetition of small critical fields (fec.py)
+  "ours_fec"  ours + selective repetition of small critical fields, and block
+              FEC for large ones whose repair would be too late (fec.py)
   "arq"       B1 - the sender resends EVERY field of a lost packet, in full
   "udp"       B4 - no recovery at all
   "snapshot"  B3 - the whole state every tick, fragmented over the MTU; a
@@ -25,6 +26,9 @@ Three independent random channels, so every policy sees the same data losses:
   rev       NACKs (gap NACKs and heartbeat requests)
 If repairs shared the data channel, a policy that sends more repairs would also
 get a different loss pattern, and the comparison would be worthless.
+
+Bit corruption (bit_error_rate > 0) has its own stream per channel too. A
+corrupted packet fails UDP's checksum and is dropped, just as a real kernel does.
 """
 
 import heapq
@@ -36,7 +40,7 @@ import config
 from src import fec, header, schema, supersession
 from src.gap_detector import GapDetector
 from src.generator import Generator
-from src.impairment import make_loss
+from src.impairment import BitErrors, make_loss, udp_checksum
 from src.metrics import Metrics
 from src.send_log import SendLog
 from src.state_table import StateTable
@@ -60,7 +64,7 @@ class Simulation:
                  mean_burst_len=config.MEAN_BURST_LEN,
                  heartbeat_s=config.HEARTBEAT_S, warmup_s=config.WARMUP_S, trace=False,
                  link=None, repetitions=config.REPETITIONS, fec_group=config.FEC_GROUP,
-                 fec_every=1, source=None, record=True):
+                 fec_every=1, source=None, record=True, bit_error_rate=config.BIT_ERROR_RATE):
         self.policy = policy
         self.duration_s, self.tick_s = duration_s, tick_s
         self.hold_down_s, self.rtt_s, self.jitter_s = hold_down_s, rtt_s, jitter_s
@@ -80,6 +84,11 @@ class Simulation:
         self.data_loss = make_loss(self.fwd_data, loss_rate, burst, mean_burst_len)
         self.ctrl_loss = make_loss(self.fwd_ctrl, loss_rate, burst, mean_burst_len)
         self.rev_loss = make_loss(self.rev, loss_rate, burst, mean_burst_len)
+        # One corruption stream per channel (seed+6..8), only drawn from when corruption is on.
+        self.bit_errors = None
+        if bit_error_rate > 0:
+            self.bit_errors = {ch: BitErrors(random.Random(seed + 6 + i), bit_error_rate)
+                               for i, ch in enumerate(("data", "ctrl", "rev"))}
 
         # sender
         self.latest_sent = {}        # truth: field id -> (version, value)
@@ -94,6 +103,13 @@ class Simulation:
         self.fec_wires = []          # this group's packets, as sent
         self.fec_groups_done = 0
         self.fec_received = {}       # receiver: seq -> (arrival time, wire), for rebuilds
+        self.parities = {}           # receiver: first seq -> (arrival time, parity packet) not yet used
+        # ours_fec: block FEC for large critical fields whose repair would land
+        # after their deadline. A repair lands tick + hold-down + 1.5 RTT after a loss.
+        repair_delay = tick_s + hold_down_s + 1.5 * rtt_s
+        self.block = fec.BlockCoder(
+            fec.block_protected(schema.active(), config.REPETITION_MAX_WIDTH, repair_delay)
+            if policy == "ours_fec" else set(), config.BLOCK_GROUP, config.BLOCK_SPACING)
         # receiver
         self.receiver = StateTable()
         self.gaps = GapDetector(f.id for f in schema.active())
@@ -127,7 +143,7 @@ class Simulation:
                           repair_bytes_obsolete=0,
                           heartbeats_sent=0, heartbeat_bytes=0, hb_requests=0,
                           hb_fields_reconciled=0, repeat_bytes=0,
-                          parity_sent=0, parity_bytes=0, fec_recovered=0)
+                          parity_sent=0, parity_bytes=0, fec_recovered=0, corrupt_dropped=0)
 
         # Episode trace for demo.py: (time, seq, kind, text). Off unless asked for.
         self.trace = [] if trace else None
@@ -186,13 +202,27 @@ class Simulation:
         else:
             self.link.send(kind, wire, delay)           # real UDP socket (udp_driver.py)
 
+    def _corrupted(self, channel, wire):
+        """Bit errors in transit. Returns the packet as received, or None when the
+        receiving UDP stack's checksum catches the damage and drops it."""
+        if self.bit_errors is None:
+            return wire
+        arrived = self.bit_errors[channel].apply(wire)
+        if arrived is not wire and udp_checksum(arrived) != udp_checksum(wire):
+            self.stats["corrupt_dropped"] += 1
+            return None
+        return arrived
+
     def _send_ctrl(self, wire):
         """Forward control channel (repairs, skips, heartbeats). Returns True if lost."""
         self.metrics.on_wire(len(wire), "ctrl", self.now)
         lost = self.ctrl_loss.drops()
         delay = self.rtt_s / 2 + self.fwd_ctrl.uniform(0, self.jitter_s)
         if not lost:
-            self._deliver(FWD, wire, delay)
+            arrived = self._corrupted("ctrl", wire)
+            lost = arrived is None
+            if not lost:
+                self._deliver(FWD, arrived, delay)
         return lost
 
     def _send_rev(self, wire):
@@ -201,7 +231,10 @@ class Simulation:
         lost = self.rev_loss.drops()
         delay = self.rtt_s / 2 + self.rev.uniform(0, self.jitter_s)
         if not lost:
-            self._deliver(REV, wire, delay)
+            arrived = self._corrupted("rev", wire)
+            lost = arrived is None
+            if not lost:
+                self._deliver(REV, arrived, delay)
         return lost
 
     # --- sender ---------------------------------------------------------------
@@ -248,39 +281,63 @@ class Simulation:
             self.stats["data_lost"] += 1
             self._log(seq, "LOST", f"seq {seq} carrying [{names(updates)}]")
         else:
-            self._deliver(FWD, wire, delay)
+            arrived = self._corrupted("data", wire)
+            if arrived is None:
+                self._log(seq, "LOST", f"seq {seq} carrying [{names(updates)}] - corrupted, "
+                                       "dropped by the UDP checksum")
+            else:
+                self._deliver(FWD, arrived, delay)
         if self.policy == "fec":
             self._fec_sent(seq, wire)
+        for members in self.block.sent(seq, wire, updates):    # no-op unless ours_fec needs it
+            self._send_parity(members, 1)
 
     def _fec_sent(self, seq, wire):
         """B2: once a group is full, send its XOR parity (on the control channel)."""
         self.fec_wires.append((seq, wire))
         if len(self.fec_wires) < self.fec_group:
             return
-        first_seq, group = self.fec_wires[0][0], self.fec_groups_done % 14 + 1
         if self.fec_groups_done % self.fec_every == 0:
-            parity = fec.parity_of([w for _, w in self.fec_wires])
-            pwire = header.pack(header.Packet(header.DATA, first_seq, 0, header.fec_byte(group, 0),
-                                              parity=parity))
-            self.stats["parity_sent"] += 1
-            self.stats["parity_bytes"] += len(pwire)
-            self._send_ctrl(pwire)
+            self._send_parity(self.fec_wires, self.fec_groups_done % 14 + 1)
         self.fec_groups_done += 1
         self.fec_wires = []
 
+    def _send_parity(self, members, group):
+        """One XOR parity packet over members [(seq, wire)], numbered by the first seq."""
+        parity = fec.parity_of([w for _, w in members])
+        pwire = header.pack(header.Packet(header.DATA, members[0][0], 0, header.fec_byte(group, 0),
+                                          parity=parity))
+        self.stats["parity_sent"] += 1
+        self.stats["parity_bytes"] += len(pwire)
+        self._send_ctrl(pwire)
+
     def _on_parity(self, pkt):
-        """B2 receiver: if exactly one packet of the group is missing, rebuild it."""
+        """Hold the parity until its group can be judged. Jitter can deliver it a moment
+        before the group's last data packet, so judging on arrival alone would miss rebuilds."""
         # Only packets that arrived recently can belong to this group: sequence numbers
         # wrap, and a leftover from 16384 seqs ago (whose parity was lost) must not count.
         self.fec_received = {s: (t, w) for s, (t, w) in self.fec_received.items()
                              if self.now - t < FEC_MEMORY_S}
-        group = [(pkt.seq + i) % (1 << config.SEQ_BITS) for i in range(self.fec_group)]
+        self.parities = {s: (t, p) for s, (t, p) in self.parities.items() if self.now - t < FEC_MEMORY_S}
+        self.parities[pkt.seq] = (self.now, pkt)
+        self._try_rebuild(pkt.seq)
+
+    def _try_rebuild(self, first):
+        """Once all but one packet of a held parity's group is here, rebuild the missing one."""
+        if self.policy == "fec":
+            size, step = self.fec_group, 1
+        else:                                   # ours_fec block groups are spaced apart
+            size, step = config.BLOCK_GROUP, config.BLOCK_SPACING
+        group = [(first + i * step) % (1 << config.SEQ_BITS) for i in range(size)]
         present = [self.fec_received[s][1] for s in group if s in self.fec_received]
-        if len(present) == self.fec_group - 1:
-            self.stats["fec_recovered"] += 1
-            self._on_forward(fec.recover(pkt.parity, present))
+        if len(present) < size - 1:
+            return                              # wait: a late member may still arrive
+        _, pkt = self.parities.pop(first)
         for s in group:
             self.fec_received.pop(s, None)
+        if len(present) == size - 1:
+            self.stats["fec_recovered"] += 1
+            self._on_forward(fec.recover(pkt.parity, present))
 
     def _send_snapshot(self):
         """B3: pack the whole state as one DATA packet, split it into MTU-sized
@@ -393,8 +450,14 @@ class Simulation:
         if header.is_parity(pkt.type, pkt.bitmap, pkt.fec):
             self._on_parity(pkt)
             return
-        if self.policy == "fec" and pkt.type == header.DATA:
+        if pkt.type == header.DATA and (self.policy == "fec" or self.block.protected):
             self.fec_received[pkt.seq] = (self.now, wire)
+            if len(self.fec_received) > 4096:     # parity may be rare: don't let this grow
+                self.fec_received = {s: (t, w) for s, (t, w) in self.fec_received.items()
+                                     if self.now - t < FEC_MEMORY_S}
+            for first in list(self.parities):     # a late member may complete a held parity
+                if first in self.parities:
+                    self._try_rebuild(first)
         if pkt.type == header.SKIP and pkt.fec == header.HB_MARK:
             self._on_digest(pkt)
             return

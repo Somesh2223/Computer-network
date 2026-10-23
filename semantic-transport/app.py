@@ -13,8 +13,9 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "frontend"))
@@ -23,6 +24,7 @@ from scenario import fields_from_spec, run_scenario    # noqa: E402
 
 PAGE = os.path.join(HERE, "frontend", "explorer.html")
 MAX_DURATION_S = 60
+RUN_LOCK = threading.Lock()      # run_scenario swaps the global field table: one run at a time
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -67,7 +69,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(exc) if isinstance(exc, ValueError) else f"Missing or bad input: {exc}"})
             return
         started = time.perf_counter()
-        data = run_scenario(fields, seed=seed, duration=duration, loss=loss, rtt=rtt, burst=bool(req.get("burst", True)))
+        with RUN_LOCK:
+            data = run_scenario(fields, seed=seed, duration=duration, loss=loss, rtt=rtt,
+                                burst=bool(req.get("burst", True)))
         data["took_s"] = round(time.perf_counter() - started, 2)
         self._json(200, data)
 
@@ -79,7 +83,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=8000)
     args = p.parse_args()
-    server = HTTPServer(("127.0.0.1", args.port), Handler)
+    # Threaded: browsers open spare connections and leave them idle, which would
+    # block a one-connection-at-a-time server until they time out.
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"Explorer in live mode at http://127.0.0.1:{args.port}  (Ctrl+C to stop)")
     try:
         server.serve_forever()

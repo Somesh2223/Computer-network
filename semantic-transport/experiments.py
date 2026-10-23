@@ -3,6 +3,7 @@
   python experiments.py                 all studies (about 12 minutes)
   python experiments.py fec workload    just the named studies
   python experiments.py realnet         figure from netem_bench.py's CSVs (run that first)
+  python experiments.py errors          bit corruption and block FEC (about 1 minute)
 
 Writes everything to results/. Numbers are findings, not targets: nothing here
 is tuned to reproduce a figure written down earlier.
@@ -14,6 +15,7 @@ is tuned to reproduce a figure written down earlier.
   5. fec                   - selective repetition vs blanket FEC (B2) at matched bytes
   6. invariants            - the hard checks of BUILD_PROMPT §11, over all runs
   7. realnet               - real sockets and kernel TCP under tc/netem (Phase 9)
+  8. errors                - bit corruption, and block FEC for large critical fields
 """
 
 import csv
@@ -313,6 +315,54 @@ def fec_study(duration_s=180.0):
     return rows, runs_ours_fec
 
 
+# --- 8. bit corruption and block FEC ---------------------------------------------
+
+def error_study():
+    """Two checks of the error-protection objectives (Review 1 objectives 6 and 9).
+
+    Corruption: bit errors on top of 10% burst loss. A corrupted packet fails the
+    UDP checksum and is dropped, so the protocol must treat it as one more loss.
+    Block FEC: on a 1.5 s round trip a repair of terrain_map lands about 2.3 s after
+    a loss, past its 2 s deadline, so ours_fec protects it in advance.
+    """
+    critical = [f for f in schema.active() if fec.is_critical(f)]
+    corruption = []
+    for ber in (0.0, 1e-5, 3e-5):
+        for policy in ("ours", "arq", "udp"):
+            runs = [Simulation(seed, policy, bit_error_rate=ber).run() for seed in config.SEEDS]
+            row = dict(bit_error_rate=ber, policy=LABEL[policy])
+            for key, vals in (
+                    ("corrupt_dropped", [s.stats["corrupt_dropped"] for s in runs]),
+                    ("recovery_bytes", [recovery_bytes(s) for s in runs]),
+                    ("critical_on_time_pct", [100 * on_time_rate(critical, s.generated, s.deliveries, s.gen_time,
+                                                                 config.WARMUP_S, s.duration_s) for s in runs]),
+                    ("mean_aoi_s", [s.metrics.mean_aoi_all() for s in runs])):
+                m, h = mean_ci(vals)
+                row[key], row[key + "_ci95"] = round(m, 3), round(h, 3)
+            row["false_suppressions"] = sum(verify_no_false_suppression(s.suppression_events, s.transmissions)
+                                            for s in runs)
+            corruption.append(row)
+    write_csv("corruption_study.csv", corruption)
+
+    terrain = [f for f in schema.active() if f.name == "terrain_map"]
+    block = []
+    for policy, label in (("udp", "B4 plain UDP"), ("ours", "Ours"), ("ours_fec", "Ours + block FEC")):
+        runs = [Simulation(seed, policy, rtt_s=1.5, duration_s=180.0).run() for seed in config.SEEDS]
+        row = dict(rtt_ms=1500, policy=label)
+        for key, vals in (
+                ("terrain_on_time_pct", [100 * on_time_rate(terrain, s.generated, s.deliveries, s.gen_time,
+                                                            config.WARMUP_S, s.duration_s) for s in runs]),
+                ("parity_bytes", [s.stats["parity_bytes"] for s in runs]),
+                ("fec_recovered", [s.stats["fec_recovered"] for s in runs])):
+            m, h = mean_ci(vals)
+            row[key], row[key + "_ci95"] = round(m, 2), round(h, 2)
+        row["false_suppressions"] = sum(verify_no_false_suppression(s.suppression_events, s.transmissions)
+                                        for s in runs)
+        block.append(row)
+    write_csv("block_fec_study.csv", block)
+    return corruption, block
+
+
 # --- 7. real network (Phase 9) --------------------------------------------------
 
 REALNET_LABEL = {"ours": "Ours", "ours_fec": "Ours + repetition", "arq": "B1 full ARQ",
@@ -443,6 +493,18 @@ def main():
         for r in rows:
             print(f"  RTT {r['rtt_ms']:>3} ms  {r['policy']:<20} extra {r['extra']:>11,.0f} B"
                   f"   critical on time {r['on_time']:6.2f} ± {r['on_time_ci95']:.2f} %   AoI {r['aoi']:.3f} s")
+    if "errors" in wanted:
+        print("error study")
+        corruption, block = error_study()
+        print("\nBit corruption on top of 10% burst loss (30 s, 5 seeds)")
+        for r in corruption:
+            print(f"  BER {r['bit_error_rate']:<7g} {r['policy']:<14} corrupted {r['corrupt_dropped']:>6.0f}"
+                  f"  recovery {r['recovery_bytes']:>9,.0f} B  critical on time {r['critical_on_time_pct']:6.2f}%"
+                  f"  AoI {r['mean_aoi_s']:.3f} s  false supp {r['false_suppressions']}")
+        print("\nBlock FEC for terrain_map at RTT 1.5 s (180 s, 10% burst loss, 5 seeds)")
+        for r in block:
+            print(f"  {r['policy']:<18} terrain on time {r['terrain_on_time_pct']:6.2f} +/- {r['terrain_on_time_pct_ci95']:.2f}%"
+                  f"  parity {r['parity_bytes']:>8,.0f} B  rebuilt {r['fec_recovered']:.1f}  false supp {r['false_suppressions']}")
     if not {"policy", "fields"} <= wanted:
         print(f"\nWrote results to {OUT}/ (invariants need the policy and fields studies)")
         return

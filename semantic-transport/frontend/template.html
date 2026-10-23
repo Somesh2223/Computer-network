@@ -360,7 +360,7 @@ footer { padding-block: 32px 48px; font-size: 13px; color: var(--ink-2); }
       <div class="panel" style="padding:16px;display:flex;flex-direction:column;gap:8px"><h3>Simulator</h3><p class="muted">Real packet encoding, simulated clock and link. Deterministic, so every number above reproduces exactly.</p></div>
       <div class="panel" style="padding:16px;display:flex;flex-direction:column;gap:8px"><h3>Real UDP sockets</h3><p class="muted">The same sender and receiver code as two processes. On seed 11 it reproduces the simulator's losses and bytes exactly, with about 2 ms extra staleness.</p></div>
       <div class="panel" style="padding:16px;display:flex;flex-direction:column;gap:8px"><h3>Linux kernel and netem</h3><p class="muted">Two network namespaces on a veth pair with tc/netem delay and loss, against the kernel's own TCP.</p></div>
-      <div class="panel" style="padding:16px;display:flex;flex-direction:column;gap:8px"><h3>Checked</h3><p class="muted">22 tests pass. Zero false suppressions in every simulated and real run, re-derived from the raw transmission log.</p></div>
+      <div class="panel" style="padding:16px;display:flex;flex-direction:column;gap:8px"><h3>Checked</h3><p class="muted">26 tests pass. Zero false suppressions in every simulated and real run, re-derived from the raw transmission log.</p></div>
     </div>
     <h3 style="margin-top:28px;margin-bottom:10px">Run it</h3>
     <div class="cmds" id="cmds"></div>
@@ -979,7 +979,7 @@ let drawAxis;
     const tb = document.createElement('tbody');
     rows.forEach((r, i) => {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td><input id="f-name-${i}" aria-label="Field ${i + 1} name"></td><td><input id="f-size-${i}" type="number" min="1" max="1400" aria-label="Field ${i + 1} size"></td><td><input id="f-every-${i}" type="number" min="1" placeholder="event" aria-label="Field ${i + 1} update period"></td><td><input id="f-gap-${i}" type="number" min="0.05" step="0.5" placeholder="—" aria-label="Field ${i + 1} event gap"></td><td><input id="f-dl-${i}" type="number" min="1" aria-label="Field ${i + 1} deadline"></td><td class="rm"><button type="button" aria-label="Remove field ${i + 1}">×</button></td>`;
+      tr.innerHTML = `<td><input id="f-name-${i}" aria-label="Field ${i + 1} name"></td><td><input id="f-size-${i}" type="number" min="1" max="1494" aria-label="Field ${i + 1} size"></td><td><input id="f-every-${i}" type="number" min="1" placeholder="event" aria-label="Field ${i + 1} update period"></td><td><input id="f-gap-${i}" type="number" min="0.05" step="0.5" placeholder="—" aria-label="Field ${i + 1} event gap"></td><td><input id="f-dl-${i}" type="number" min="1" aria-label="Field ${i + 1} deadline"></td><td class="rm"><button type="button" aria-label="Remove field ${i + 1}">×</button></td>`;
       const set = (id, key) => { const inp = tr.querySelector(id); inp.value = r[key]; inp.addEventListener('input', () => { r[key] = inp.value; }); };
       set(`#f-name-${i}`, 'name'); set(`#f-size-${i}`, 'size'); set(`#f-every-${i}`, 'every_ms'); set(`#f-gap-${i}`, 'mean_gap_s'); set(`#f-dl-${i}`, 'deadline_ms');
       tr.querySelector('button').addEventListener('click', () => { if (rows.length > 1) { rows.splice(i, 1); renderRows(); } });
@@ -1056,7 +1056,7 @@ let drawAxis;
 
 /* ---------- commands ---------- */
 (function cmds() {
-  const list = [['python app.py', 'this page in live mode: run your own fields and link'], ['python examples/plant_dashboard.py', 'then examples/plant_sender.py: the set/get API in an example program'], ['python demo.py --seed 23', 'narrated demo: every verdict and the heartbeat'], ['python demo.py --compare', 'ours, full ARQ and UDP on one loss trace'], ['python -m pytest -v', 'the 22 tests'], ['python experiments.py', 'every study, CSV and figure (about 12 min)'], ['python3 udp_driver.py --policy ours', 'real UDP sockets, two processes (Linux or WSL)'], ['sudo python3 netem_bench.py --quick', 'real kernel and TCP under tc/netem (root)']];
+  const list = [['python app.py', 'this page in live mode: run your own fields and link'], ['python examples/plant_dashboard.py', 'then examples/plant_sender.py: the set/get API in an example program'], ['python demo.py --seed 23', 'narrated demo: every verdict and the heartbeat'], ['python demo.py --compare', 'ours, full ARQ and UDP on one loss trace'], ['python -m pytest -v', 'the 26 tests'], ['python experiments.py', 'every study, CSV and figure (about 12 min)'], ['python3 udp_driver.py --policy ours', 'real UDP sockets, two processes (Linux or WSL)'], ['sudo python3 netem_bench.py --quick', 'real kernel and TCP under tc/netem (root)']];
   const box = document.getElementById('cmds');
   for (const [c, d] of list) {
     const row = document.createElement('div'); row.className = 'panel cmd';

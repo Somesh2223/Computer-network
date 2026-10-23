@@ -14,6 +14,7 @@ TICK_S = 0.010                     # sender packs pending updates every tick
 HOLD_DOWN_S = 0.005                # receiver waits this long before NACKing
 RTT_S = 0.060
 JITTER_S = 0.002
+BIT_ERROR_RATE = 0.0              # chance each bit flips in transit; 0 = no corruption
 HEARTBEAT_S = 1.0
 EWMA_ALPHA = 0.2                   # smoothing for the per-field update interval
 WARMUP_S = 3.0                     # excluded from AoI statistics
@@ -29,3 +30,5 @@ REPETITIONS = 2                    # ours_fec: a small critical field rides in k
 REPETITION_MAX_WIDTH = 16          # ...if it is at most this many bytes
 REPETITION_SPACING = 5             # packets between copies: more than a typical loss burst
 FEC_GROUP = 15                     # B2: data packets per XOR parity packet (4-bit index caps it)
+BLOCK_GROUP = 3                    # ours_fec: a large critical update + 2 later packets share one parity
+BLOCK_SPACING = 5                  # packets between members of that group, like REPETITION_SPACING
